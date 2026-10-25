@@ -1,4 +1,7 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import {
   evaluatePlayBoundary,
   calculateDistanceMeters,
@@ -102,6 +105,7 @@ export interface GameRecord {
   state: GameState;
   hostId: string;
   createdAt: number;
+  updatedAt: number;
   countdownEndsAt: number | null;
   endsAt: number | null;
   pausedRemainingMs: number | null;
@@ -143,16 +147,176 @@ export interface GameRecord {
 }
 
 const AVATAR_COLORS = ['#14532D', '#C2410C', '#0369A1', '#7E22CE', '#B45309', '#BE123C'];
+const ROOM_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const SHARED_STORE_DIR = path.join(os.tmpdir(), 'aui_manhunt_rooms_v1');
 
 const globalForManhunt = globalThis as unknown as {
   auiManhuntRooms?: Map<string, GameRecord>;
 };
 
-function getLocalRooms(): Map<string, GameRecord> {
+export function normalizeRoomCode(raw: string): string {
+  return String(raw || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '');
+}
+
+function getLocalRoomsMap(): Map<string, GameRecord> {
   if (!globalForManhunt.auiManhuntRooms) {
     globalForManhunt.auiManhuntRooms = new Map<string, GameRecord>();
   }
   return globalForManhunt.auiManhuntRooms;
+}
+
+interface SerializedGameRecord {
+  id: string;
+  code: string;
+  title: string;
+  state: GameState;
+  hostId: string;
+  createdAt: number;
+  updatedAt: number;
+  countdownEndsAt: number | null;
+  endsAt: number | null;
+  pausedRemainingMs: number | null;
+  winnerTeam: 'HUNTERS' | 'HIDERS' | 'NONE' | null;
+  winReason: string | null;
+  settings: GameRecord['settings'];
+  participants: Array<[string, ParticipantRecord]>;
+  secretRoles: Array<[string, PlayerRole]>;
+  locations: Array<[string, LocationRecord]>;
+  soundUsage: Array<[string, { usedCount: number; cooldownUntil: number }]>;
+  soundAlerts: SoundAlertRecord[];
+  walkieMessages: WalkieTalkieMessageRecord[];
+  tauntAlerts: TauntAlertRecord[];
+  capturesLog: CaptureLogRecord[];
+  tauntCooldownByParticipant: Array<[string, number]>;
+  photoRequestsByHider: Array<[string, PhotoRequestRecord]>;
+  photoRequestCountByHider: Array<[string, number]>;
+  outsideSinceByParticipant: Array<[string, number]>;
+  ghostCloakByHider: Array<[string, { usedCount: number; maxUses: number; activeUntil: number }]>;
+  catchPinsByHider: Array<[string, string]>;
+}
+
+function serializeGameRecord(game: GameRecord): SerializedGameRecord {
+  return {
+    id: game.id,
+    code: game.code,
+    title: game.title,
+    state: game.state,
+    hostId: game.hostId,
+    createdAt: game.createdAt,
+    updatedAt: game.updatedAt || Date.now(),
+    countdownEndsAt: game.countdownEndsAt,
+    endsAt: game.endsAt,
+    pausedRemainingMs: game.pausedRemainingMs,
+    winnerTeam: game.winnerTeam,
+    winReason: game.winReason,
+    settings: game.settings,
+    participants: Array.from(game.participants.entries()),
+    secretRoles: Array.from(game.secretRoles.entries()),
+    locations: Array.from(game.locations.entries()),
+    soundUsage: Array.from(game.soundUsage.entries()),
+    soundAlerts: game.soundAlerts,
+    walkieMessages: game.walkieMessages,
+    tauntAlerts: game.tauntAlerts,
+    capturesLog: game.capturesLog,
+    tauntCooldownByParticipant: Array.from(game.tauntCooldownByParticipant.entries()),
+    photoRequestsByHider: Array.from(game.photoRequestsByHider.entries()),
+    photoRequestCountByHider: Array.from(game.photoRequestCountByHider.entries()),
+    outsideSinceByParticipant: Array.from(game.outsideSinceByParticipant.entries()),
+    ghostCloakByHider: Array.from(game.ghostCloakByHider.entries()),
+    catchPinsByHider: Array.from(game.catchPinsByHider.entries()),
+  };
+}
+
+function deserializeGameRecord(raw: SerializedGameRecord): GameRecord {
+  return {
+    id: raw.id,
+    code: raw.code,
+    title: raw.title,
+    state: raw.state,
+    hostId: raw.hostId,
+    createdAt: raw.createdAt,
+    updatedAt: raw.updatedAt || raw.createdAt,
+    countdownEndsAt: raw.countdownEndsAt,
+    endsAt: raw.endsAt,
+    pausedRemainingMs: raw.pausedRemainingMs,
+    winnerTeam: raw.winnerTeam,
+    winReason: raw.winReason,
+    settings: raw.settings,
+    participants: new Map(raw.participants || []),
+    secretRoles: new Map(raw.secretRoles || []),
+    locations: new Map(raw.locations || []),
+    soundUsage: new Map(raw.soundUsage || []),
+    soundAlerts: raw.soundAlerts || [],
+    walkieMessages: raw.walkieMessages || [],
+    tauntAlerts: raw.tauntAlerts || [],
+    capturesLog: raw.capturesLog || [],
+    tauntCooldownByParticipant: new Map(raw.tauntCooldownByParticipant || []),
+    photoRequestsByHider: new Map(raw.photoRequestsByHider || []),
+    photoRequestCountByHider: new Map(raw.photoRequestCountByHider || []),
+    outsideSinceByParticipant: new Map(raw.outsideSinceByParticipant || []),
+    ghostCloakByHider: new Map(raw.ghostCloakByHider || []),
+    catchPinsByHider: new Map(raw.catchPinsByHider || []),
+  };
+}
+
+function getRoomFilePath(cleanCode: string): string {
+  return path.join(SHARED_STORE_DIR, `${cleanCode}.json`);
+}
+
+function saveRoomToSharedStore(game: GameRecord): void {
+  const cleanCode = normalizeRoomCode(game.code);
+  game.updatedAt = Date.now();
+  getLocalRoomsMap().set(cleanCode, game);
+  try {
+    if (!fs.existsSync(SHARED_STORE_DIR)) {
+      fs.mkdirSync(SHARED_STORE_DIR, { recursive: true });
+    }
+    const filePath = getRoomFilePath(cleanCode);
+    const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(serializeGameRecord(game)), 'utf8');
+    fs.renameSync(tmpPath, filePath);
+  } catch {
+    // Ignore filesystem errors in restricted read-only environments
+  }
+}
+
+function loadRoomFromSharedStore(rawCode: string): GameRecord | undefined {
+  const cleanCode = normalizeRoomCode(rawCode);
+  if (!cleanCode) return undefined;
+
+  const memMap = getLocalRoomsMap();
+  const inMem = memMap.get(cleanCode);
+
+  try {
+    const filePath = getRoomFilePath(cleanCode);
+    if (fs.existsSync(filePath)) {
+      const stat = fs.statSync(filePath);
+      if (Date.now() - stat.mtimeMs > ROOM_TTL_MS) {
+        fs.unlinkSync(filePath);
+        memMap.delete(cleanCode);
+        return undefined;
+      }
+      if (!inMem || stat.mtimeMs > (inMem.updatedAt || 0)) {
+        const content = fs.readFileSync(filePath, 'utf8');
+        const parsed = JSON.parse(content) as SerializedGameRecord;
+        const hydrated = deserializeGameRecord(parsed);
+        memMap.set(cleanCode, hydrated);
+        return hydrated;
+      }
+    }
+  } catch {
+    // Fallback to in-memory map if disk read fails
+  }
+
+  if (inMem && Date.now() - (inMem.updatedAt || inMem.createdAt) > ROOM_TTL_MS) {
+    memMap.delete(cleanCode);
+    return undefined;
+  }
+
+  return inMem;
 }
 
 export function generateRoomCode(): string {
@@ -195,28 +359,31 @@ function computeEffectiveRadiusMeters(game: GameRecord, now: number): number {
   if (elapsedMs < halfMs) {
     return initialRadius;
   }
-  // Shrink by 15% when entering the second half, and an additional 15% every 5 minutes thereafter
   const fiveMinutesMs = 5 * 60 * 1000;
   const shrinkSteps = Math.floor((elapsedMs - halfMs) / fiveMinutesMs) + 1;
   return Math.max(60, Math.round(initialRadius * Math.pow(0.85, shrinkSteps)));
 }
 
-function tickLocalLifecycle(game: GameRecord): void {
+function tickLocalLifecycle(game: GameRecord): boolean {
   const now = Date.now();
+  let mutated = false;
+
   if (game.state === 'COUNTDOWN' && game.countdownEndsAt && now >= game.countdownEndsAt) {
     game.state = 'ACTIVE';
+    mutated = true;
   }
   if (game.state === 'ACTIVE' && game.endsAt && now >= game.endsAt) {
     const remainingHiders = Array.from(game.participants.values()).filter(
       (p) => game.secretRoles.get(p.id) === 'HIDER' && p.status === 'ACTIVE'
     );
     finishLocalGame(game, 'HIDERS', `Time expired with ${remainingHiders.length} Hider(s) still free on campus!`);
+    mutated = true;
   }
   if (game.state === 'ACTIVE' || game.state === 'PAUSED') {
     const effectiveRadius = computeEffectiveRadiusMeters(game, now);
     if (game.settings.boundary.radiusMeters !== effectiveRadius) {
       game.settings.boundary.radiusMeters = effectiveRadius;
-      // Re-evaluate participant boundary status when zone shrinks
+      mutated = true;
       for (const [pid, loc] of Array.from(game.locations.entries())) {
         const check = evaluatePlayBoundary(loc.lat, loc.lng, loc.accuracy, game.settings.boundary);
         loc.distanceMeters = check.distanceMeters;
@@ -235,8 +402,13 @@ function tickLocalLifecycle(game: GameRecord): void {
   for (const req of Array.from(game.photoRequestsByHider.values())) {
     if (req.status === 'PENDING' && now >= req.expiresAt) {
       req.status = 'EXPIRED';
+      mutated = true;
     }
   }
+  if (mutated) {
+    saveRoomToSharedStore(game);
+  }
+  return mutated;
 }
 
 function finishLocalGame(game: GameRecord, winnerTeam: 'HUNTERS' | 'HIDERS' | 'NONE', winReason: string): void {
@@ -274,7 +446,7 @@ export async function createGameSession(input: {
     throw new Error('Nickname must be between 3 and 15 characters.');
   }
 
-  const code = generateRoomCode();
+  const code = normalizeRoomCode(generateRoomCode());
   const now = Date.now();
   const photoRequestsPerHider = input.photoRequestsPerHider ?? 1;
   const ghostCloakUsesPerHider = input.ghostCloakUsesPerHider ?? 1;
@@ -287,48 +459,50 @@ export async function createGameSession(input: {
   const shrinkingZone = Boolean(input.shrinkingZone);
 
   if (isSupabaseConfigured()) {
-    const sb = getSupabaseAdminClient();
-    const { data: gameRow, error: gErr } = await sb
-      .from('games')
-      .insert({
-        code,
-        title: input.title || 'AUI Campus Manhunt',
-        state: 'LOBBY',
-        hunter_count: input.hunterCount,
-        duration_minutes: input.durationMinutes,
-        countdown_seconds: input.countdownSeconds,
-        sound_uses_per_hunter: input.soundUses,
-        sound_cooldown_seconds: input.soundCooldownSeconds,
-        boundary_lat: input.boundary.lat,
-        boundary_lng: input.boundary.lng,
-        boundary_radius_m: input.boundary.radiusMeters,
-      })
-      .select('*')
-      .single();
+    try {
+      const sb = getSupabaseAdminClient();
+      const { data: gameRow, error: gErr } = await sb
+        .from('games')
+        .insert({
+          code,
+          title: input.title || 'AUI Campus Manhunt',
+          state: 'LOBBY',
+          hunter_count: input.hunterCount,
+          duration_minutes: input.durationMinutes,
+          countdown_seconds: input.countdownSeconds,
+          sound_uses_per_hunter: input.soundUses,
+          sound_cooldown_seconds: input.soundCooldownSeconds,
+          boundary_lat: input.boundary.lat,
+          boundary_lng: input.boundary.lng,
+          boundary_radius_m: input.boundary.radiusMeters,
+        })
+        .select('*')
+        .single();
 
-    if (gErr || !gameRow) throw new Error(gErr?.message || 'Failed to create game in Supabase.');
+      if (!gErr && gameRow) {
+        const { data: hostRow, error: pErr } = await sb
+          .from('participants')
+          .insert({
+            game_id: gameRow.id,
+            nickname: cleanHostNickname,
+            avatar_color: AVATAR_COLORS[0],
+            is_host: true,
+            ready: false,
+            status: 'ACTIVE',
+          })
+          .select('*')
+          .single();
 
-    const { data: hostRow, error: pErr } = await sb
-      .from('participants')
-      .insert({
-        game_id: gameRow.id,
-        nickname: cleanHostNickname,
-        avatar_color: AVATAR_COLORS[0],
-        is_host: true,
-        ready: false,
-        status: 'ACTIVE',
-      })
-      .select('*')
-      .single();
-
-    if (pErr || !hostRow) throw new Error(pErr?.message || 'Failed to create host participant.');
-
-    await sb.from('games').update({ host_participant_id: hostRow.id }).eq('id', gameRow.id);
-
-    return { code, participantId: hostRow.id, storageMode: 'SUPABASE' as const };
+        if (!pErr && hostRow) {
+          await sb.from('games').update({ host_participant_id: hostRow.id }).eq('id', gameRow.id);
+          return { code, participantId: hostRow.id, storageMode: 'SUPABASE' as const };
+        }
+      }
+    } catch {
+      // Fall back to shared serverless store if Supabase tables are not migrated or unreachable
+    }
   }
 
-  const rooms = getLocalRooms();
   const hostId = generateSecureId('plr');
   const game: GameRecord = {
     id: generateSecureId('game'),
@@ -337,6 +511,7 @@ export async function createGameSession(input: {
     state: 'LOBBY',
     hostId,
     createdAt: now,
+    updatedAt: now,
     countdownEndsAt: null,
     endsAt: null,
     pausedRemainingMs: null,
@@ -393,56 +568,70 @@ export async function createGameSession(input: {
     joinedAt: now,
   });
 
-  rooms.set(code, game);
+  saveRoomToSharedStore(game);
   return { code, participantId: hostId, storageMode: 'LOCAL_MEMORY' as const };
 }
 
 export async function joinGameSession(code: string, nickname: string) {
-  const cleanCode = code.trim().toUpperCase();
+  const cleanCode = normalizeRoomCode(code);
   const cleanName = nickname.trim();
 
+  if (cleanCode.length !== 6) {
+    throw new Error('Please enter a valid 6-character room code.');
+  }
   if (cleanName.length < 3 || cleanName.length > 15) {
     throw new Error('Nickname must be between 3 and 15 characters.');
   }
 
-  if (isSupabaseConfigured() && !getLocalRooms().has(cleanCode)) {
+  const localGame = loadRoomFromSharedStore(cleanCode);
+
+  if (isSupabaseConfigured() && !localGame) {
     const sb = getSupabaseAdminClient();
-    const { data: gameRow } = await sb.from('games').select('*').eq('code', cleanCode).single();
-    if (!gameRow) throw new Error('Room code not found. Check the 6-character code with your host.');
-    if (gameRow.state !== 'LOBBY') throw new Error('This game has already started.');
+    const { data: gameRow } = await sb.from('games').select('*').eq('code', cleanCode).maybeSingle();
+    if (gameRow) {
+      if (gameRow.state !== 'LOBBY') throw new Error('This game has already started and is no longer accepting new players.');
 
-    const { data: existingPlayers } = await sb.from('participants').select('*').eq('game_id', gameRow.id);
-    const list = existingPlayers || [];
-    if (list.length >= 12) throw new Error('This game lobby is full (12 players max).');
-    if (list.some((p) => p.nickname.trim().toLowerCase() === cleanName.toLowerCase())) {
-      throw new Error(`Nickname "${cleanName}" is already taken in this lobby.`);
+      const { data: existingPlayers } = await sb.from('participants').select('*').eq('game_id', gameRow.id);
+      const list = existingPlayers || [];
+      if (list.length >= 12) throw new Error('This game lobby is full (12 players maximum).');
+      if (list.some((p) => p.nickname.trim().toLowerCase() === cleanName.toLowerCase())) {
+        throw new Error(`Nickname "${cleanName}" is already taken in room ${cleanCode}. Choose a different nickname.`);
+      }
+
+      const color = AVATAR_COLORS[list.length % AVATAR_COLORS.length];
+      const { data: newPlayer, error: pErr } = await sb
+        .from('participants')
+        .insert({
+          game_id: gameRow.id,
+          nickname: cleanName,
+          avatar_color: color,
+          is_host: false,
+          ready: false,
+          status: 'ACTIVE',
+        })
+        .select('*')
+        .single();
+
+      if (pErr || !newPlayer) throw new Error(pErr?.message || 'Could not join game lobby.');
+      return { code: cleanCode, participantId: newPlayer.id, storageMode: 'SUPABASE' as const };
     }
-
-    const color = AVATAR_COLORS[list.length % AVATAR_COLORS.length];
-    const { data: newPlayer, error: pErr } = await sb
-      .from('participants')
-      .insert({
-        game_id: gameRow.id,
-        nickname: cleanName,
-        avatar_color: color,
-        is_host: false,
-        ready: false,
-        status: 'ACTIVE',
-      })
-      .select('*')
-      .single();
-
-    if (pErr || !newPlayer) throw new Error(pErr?.message || 'Could not join game.');
-    return { code: cleanCode, participantId: newPlayer.id, storageMode: 'SUPABASE' as const };
   }
 
-  const game = getLocalRooms().get(cleanCode);
-  if (!game) throw new Error('Room code not found. Check the 6-character code with your host.');
-  if (game.state !== 'LOBBY') throw new Error('This game has already started.');
-  if (game.participants.size >= game.settings.maxPlayers) throw new Error('This game lobby is full.');
+  const game = localGame;
+  if (!game) {
+    throw new Error(
+      `Room "${cleanCode}" was not found or has expired. Ask the host to verify the 6-character Room Code or create a new lobby.`
+    );
+  }
+  if (game.state !== 'LOBBY') {
+    throw new Error('This game has already started and is no longer accepting new players.');
+  }
+  if (game.participants.size >= game.settings.maxPlayers) {
+    throw new Error('This game lobby is full (12 players maximum).');
+  }
   for (const p of Array.from(game.participants.values())) {
     if (p.nickname.trim().toLowerCase() === cleanName.toLowerCase()) {
-      throw new Error(`Nickname "${cleanName}" is already taken in this lobby.`);
+      throw new Error(`Nickname "${cleanName}" is already taken in room ${cleanCode}. Choose a different nickname.`);
     }
   }
 
@@ -464,6 +653,7 @@ export async function joinGameSession(code: string, nickname: string) {
     joinedAt: Date.now(),
   });
 
+  saveRoomToSharedStore(game);
   return { code: cleanCode, participantId, storageMode: 'LOCAL_MEMORY' as const };
 }
 
@@ -492,12 +682,13 @@ export async function submitParticipantGps(input: {
     throw new Error('Invalid or out-of-range GPS coordinates.');
   }
 
-  const cleanCode = input.code.trim().toUpperCase();
+  const cleanCode = normalizeRoomCode(input.code);
+  const localGame = loadRoomFromSharedStore(cleanCode);
 
-  if (isSupabaseConfigured() && !getLocalRooms().has(cleanCode)) {
+  if (isSupabaseConfigured() && !localGame) {
     const sb = getSupabaseAdminClient();
-    const { data: gameRow } = await sb.from('games').select('*').eq('code', cleanCode).single();
-    if (!gameRow) throw new Error('Game not found.');
+    const { data: gameRow } = await sb.from('games').select('*').eq('code', cleanCode).maybeSingle();
+    if (!gameRow) throw new Error(`Room "${cleanCode}" not found or expired.`);
     if (gameRow.state !== 'COUNTDOWN' && gameRow.state !== 'ACTIVE') {
       throw new Error('GPS updates are only accepted during COUNTDOWN or ACTIVE game states.');
     }
@@ -543,8 +734,8 @@ export async function submitParticipantGps(input: {
     return { updatedAt: Date.now(), boundaryCheck };
   }
 
-  const game = getLocalRooms().get(cleanCode);
-  if (!game) throw new Error('Game not found.');
+  const game = localGame;
+  if (!game) throw new Error(`Room "${cleanCode}" not found or expired.`);
   tickLocalLifecycle(game);
 
   if (game.state !== 'COUNTDOWN' && game.state !== 'ACTIVE') {
@@ -579,20 +770,25 @@ export async function submitParticipantGps(input: {
     isOutside: boundaryCheck.isOutsideWithGrace,
   });
 
+  saveRoomToSharedStore(game);
   return { updatedAt, boundaryCheck };
 }
 
 export async function performGameAction(code: string, payload: Record<string, unknown>) {
-  const cleanCode = code.trim().toUpperCase();
+  const cleanCode = normalizeRoomCode(code);
   const action = String(payload.action);
   const participantId = String(payload.participantId);
 
-  if (isSupabaseConfigured() && !getLocalRooms().has(cleanCode)) {
+  const localGame = loadRoomFromSharedStore(cleanCode);
+
+  if (isSupabaseConfigured() && !localGame) {
     return performSupabaseGameAction(cleanCode, action, participantId, payload);
   }
 
-  const game = getLocalRooms().get(cleanCode);
-  if (!game) throw new Error('Game not found.');
+  const game = localGame;
+  if (!game) {
+    throw new Error(`Room "${cleanCode}" was not found or has expired.`);
+  }
   tickLocalLifecycle(game);
 
   const actor = game.participants.get(participantId);
@@ -601,6 +797,7 @@ export async function performGameAction(code: string, payload: Record<string, un
   switch (action) {
     case 'TOGGLE_READY': {
       if (game.state === 'LOBBY') actor.ready = !actor.ready;
+      saveRoomToSharedStore(game);
       return { ok: true };
     }
     case 'UPDATE_RULES': {
@@ -659,6 +856,7 @@ export async function performGameAction(code: string, payload: Record<string, un
           game.settings.initialRadiusMeters = r;
         }
       }
+      saveRoomToSharedStore(game);
       return { ok: true };
     }
     case 'START_GAME': {
@@ -717,16 +915,19 @@ export async function performGameAction(code: string, payload: Record<string, un
         game.countdownEndsAt = now;
         game.endsAt = now + game.settings.durationMinutes * 60 * 1000;
       }
+      saveRoomToSharedStore(game);
       return { ok: true };
     }
     case 'SET_CONSENT': {
       actor.gpsConsent = Boolean(payload.consent);
       actor.gpsDenied = Boolean(payload.denied);
       if (!actor.gpsConsent) game.locations.delete(participantId);
+      saveRoomToSharedStore(game);
       return { ok: true };
     }
     case 'UNLOCK_AUDIO': {
       actor.audioUnlocked = true;
+      saveRoomToSharedStore(game);
       return { ok: true };
     }
     case 'ACTIVATE_GHOST_CLOAK': {
@@ -755,6 +956,7 @@ export async function performGameAction(code: string, payload: Record<string, un
         maxUses,
         activeUntil,
       });
+      saveRoomToSharedStore(game);
       return { ok: true, activeUntil, remainingUses: Math.max(0, maxUses - (existing.usedCount + 1)) };
     }
     case 'SEND_WALKIE_TALKIE': {
@@ -777,11 +979,11 @@ export async function performGameAction(code: string, payload: Record<string, un
         durationSeconds,
         createdAt: now,
       };
-      // Keep only recent messages (last 25s, max 8 clips) to keep memory light
       game.walkieMessages = game.walkieMessages
         .filter((m) => now - m.createdAt < 25000)
-        .slice(-7);
+        .slice(-5);
       game.walkieMessages.push(msg);
+      saveRoomToSharedStore(game);
       return { ok: true, messageId: msg.id };
     }
     case 'SEND_TAUNT': {
@@ -807,8 +1009,9 @@ export async function performGameAction(code: string, payload: Record<string, un
         tauntType,
         createdAt: now,
       };
-      game.tauntAlerts = game.tauntAlerts.filter((t) => now - t.createdAt < 20000).slice(-12);
+      game.tauntAlerts = game.tauntAlerts.filter((t) => now - t.createdAt < 20000).slice(-10);
       game.tauntAlerts.push(taunt);
+      saveRoomToSharedStore(game);
       return { ok: true, tauntId: taunt.id };
     }
     case 'SEND_SOUND': {
@@ -845,6 +1048,7 @@ export async function performGameAction(code: string, payload: Record<string, un
         createdAt: now,
       };
       game.soundAlerts.push(alertRecord);
+      saveRoomToSharedStore(game);
       return { ok: true, deliveryStatus, alertId: alertRecord.id };
     }
     case 'REQUEST_PHOTO': {
@@ -880,6 +1084,7 @@ export async function performGameAction(code: string, payload: Record<string, un
       };
       game.photoRequestsByHider.set(targetHiderId, req);
       game.photoRequestCountByHider.set(targetHiderId, usedCount + 1);
+      saveRoomToSharedStore(game);
       return { ok: true, photoRequestId: req.id };
     }
     case 'RESPOND_PHOTO': {
@@ -888,6 +1093,7 @@ export async function performGameAction(code: string, payload: Record<string, un
       if (req.status !== 'PENDING') throw new Error(`This photo request is already ${req.status.toLowerCase()}.`);
       if (payload.declined) {
         req.status = 'DECLINED';
+        saveRoomToSharedStore(game);
         return { ok: true };
       }
       const dataUrl = String(payload.photoDataUrl || '');
@@ -895,6 +1101,7 @@ export async function performGameAction(code: string, payload: Record<string, un
       req.status = 'SUBMITTED';
       req.photoDataUrl = dataUrl;
       req.submittedAt = Date.now();
+      saveRoomToSharedStore(game);
       return { ok: true };
     }
     case 'MARK_CAUGHT': {
@@ -937,7 +1144,6 @@ export async function performGameAction(code: string, payload: Record<string, un
             }
           }
         }
-        // INSTANT_TAP mode requires neither PIN nor proximity check
       }
 
       target.status = 'CAPTURED';
@@ -962,6 +1168,7 @@ export async function performGameAction(code: string, payload: Record<string, un
       if (remainingHiders.length === 0) {
         finishLocalGame(game, 'HUNTERS', 'All Hiders were caught on campus!');
       }
+      saveRoomToSharedStore(game);
       return { ok: true };
     }
     case 'TOGGLE_PAUSE': {
@@ -975,10 +1182,12 @@ export async function performGameAction(code: string, payload: Record<string, un
         game.pausedRemainingMs = null;
         game.state = 'ACTIVE';
       }
+      saveRoomToSharedStore(game);
       return { ok: true };
     }
     case 'EMERGENCY_STOP': {
       finishLocalGame(game, 'NONE', 'Game stopped early via Emergency / Host Stop.');
+      saveRoomToSharedStore(game);
       return { ok: true };
     }
     case 'REMATCH': {
@@ -1006,6 +1215,7 @@ export async function performGameAction(code: string, payload: Record<string, un
         p.capturedByNickname = null;
         p.capturesCount = 0;
       }
+      saveRoomToSharedStore(game);
       return { ok: true };
     }
     default:
@@ -1020,8 +1230,8 @@ async function performSupabaseGameAction(
   payload: Record<string, unknown>
 ) {
   const sb = getSupabaseAdminClient();
-  const { data: gameRow } = await sb.from('games').select('*').eq('code', cleanCode).single();
-  if (!gameRow) throw new Error('Game not found.');
+  const { data: gameRow } = await sb.from('games').select('*').eq('code', cleanCode).maybeSingle();
+  if (!gameRow) throw new Error(`Room "${cleanCode}" not found or expired.`);
 
   const { data: actorRow } = await sb
     .from('participants')
@@ -1042,7 +1252,7 @@ async function performSupabaseGameAction(
       if (gameRow.host_participant_id !== participantId) throw new Error('Only the host can update game settings.');
       if (gameRow.state === 'LOBBY') {
         const updates: Record<string, unknown> = {
-          hunter_count: Math.max(1, Math.min(4, Number(payload.hunterCount) || 1)),
+          hunter_count: Math.max(1, Math.min(5, Number(payload.hunterCount) || 1)),
           duration_minutes: Math.max(5, Math.min(90, Number(payload.durationMinutes) || 20)),
         };
         if (payload.countdownSeconds !== undefined) {
@@ -1304,15 +1514,23 @@ async function performSupabaseGameAction(
   }
 }
 
-export async function getAuthorizedGameState(code: string, viewerId: string) {
-  const cleanCode = code.trim().toUpperCase();
+export async function getAuthorizedGameState(
+  code: string,
+  viewerId: string,
+  options?: { sinceMs?: number; includeMedia?: boolean }
+) {
+  const cleanCode = normalizeRoomCode(code);
+  const sinceMs = options?.sinceMs && Number.isFinite(options.sinceMs) ? Number(options.sinceMs) : 0;
+  const includeMedia = Boolean(options?.includeMedia);
 
-  if (isSupabaseConfigured() && !getLocalRooms().has(cleanCode)) {
-    return getSupabaseAuthorizedState(cleanCode, viewerId);
+  const localGame = loadRoomFromSharedStore(cleanCode);
+
+  if (isSupabaseConfigured() && !localGame) {
+    return getSupabaseAuthorizedState(cleanCode, viewerId, sinceMs, includeMedia);
   }
 
-  const game = getLocalRooms().get(cleanCode);
-  if (!game) throw new Error('Game not found.');
+  const game = localGame;
+  if (!game) throw new Error(`Room "${cleanCode}" not found or expired.`);
   tickLocalLifecycle(game);
 
   const viewer = game.participants.get(viewerId);
@@ -1406,12 +1624,18 @@ export async function getAuthorizedGameState(code: string, viewerId: string) {
     if (viewerRole === 'HUNTER' || isSelf) {
       const pr = game.photoRequestsByHider.get(p.id);
       if (pr) {
+        const canViewPhoto = Boolean(pr.photoDataUrl && (viewerRole === 'HUNTER' || isSelf));
+        // Delta sync: only transmit heavy Base64 photoDataUrl if newly submitted after sinceMs or explicitly requested
+        const isNewPhoto = Boolean(
+          canViewPhoto &&
+            (includeMedia || !sinceMs || (pr.submittedAt && pr.submittedAt >= sinceMs - 3500))
+        );
         photoRequestView = {
           id: pr.id,
           status: pr.status,
           expiresInSeconds: Math.max(0, Math.ceil((pr.expiresAt - now) / 1000)),
-          hasPhoto: Boolean(pr.photoDataUrl && (viewerRole === 'HUNTER' || isSelf)),
-          photoDataUrl: viewerRole === 'HUNTER' || isSelf ? pr.photoDataUrl : null,
+          hasPhoto: canViewPhoto,
+          photoDataUrl: isNewPhoto ? pr.photoDataUrl : null,
           remainingRequests: remainingPhotoRequests,
         };
       }
@@ -1502,11 +1726,14 @@ export async function getAuthorizedGameState(code: string, viewerId: string) {
     }
   }
 
-  const recentTargetedAlert =
-    game.soundAlerts.filter((a) => a.targetHiderId === viewerId && now - a.createdAt < 15000).slice(-1)[0] || null;
+  // Delta sync for audio/event broadcasts: only transmit events created after sinceMs - 3000ms
+  const eventCutoffMs = sinceMs > 0 ? Math.max(now - 15000, sinceMs - 3000) : now - 15000;
 
-  const recentWalkieMessages = game.walkieMessages.filter((m) => now - m.createdAt < 18000);
-  const recentTaunts = game.tauntAlerts.filter((t) => now - t.createdAt < 14000);
+  const recentTargetedAlert =
+    game.soundAlerts.filter((a) => a.targetHiderId === viewerId && a.createdAt >= eventCutoffMs).slice(-1)[0] || null;
+
+  const recentWalkieMessages = game.walkieMessages.filter((m) => m.createdAt >= eventCutoffMs);
+  const recentTaunts = game.tauntAlerts.filter((t) => t.createdAt >= eventCutoffMs);
   const tauntCooldownSecondsLeft = Math.max(
     0,
     Math.ceil(((game.tauntCooldownByParticipant.get(viewerId) || 0) - now) / 1000)
@@ -1518,6 +1745,7 @@ export async function getAuthorizedGameState(code: string, viewerId: string) {
     title: game.title,
     state: game.state,
     storageMode: 'LOCAL_MEMORY' as const,
+    serverTime: now,
     hostId: game.hostId,
     viewerId,
     viewerRole,
@@ -1550,10 +1778,15 @@ export async function getAuthorizedGameState(code: string, viewerId: string) {
   };
 }
 
-async function getSupabaseAuthorizedState(cleanCode: string, viewerId: string) {
+async function getSupabaseAuthorizedState(
+  cleanCode: string,
+  viewerId: string,
+  sinceMs = 0,
+  includeMedia = false
+) {
   const sb = getSupabaseAdminClient();
-  const { data: gameRow } = await sb.from('games').select('*').eq('code', cleanCode).single();
-  if (!gameRow) throw new Error('Game not found.');
+  const { data: gameRow } = await sb.from('games').select('*').eq('code', cleanCode).maybeSingle();
+  if (!gameRow) throw new Error(`Room "${cleanCode}" not found or expired.`);
 
   const now = Date.now();
   let currentState = gameRow.state as GameState;
@@ -1588,7 +1821,7 @@ async function getSupabaseAuthorizedState(cleanCode: string, viewerId: string) {
     sb.from('participant_roles').select('*').eq('game_id', gameRow.id),
     sb.from('participant_locations').select('*').eq('game_id', gameRow.id),
     sb.from('sound_ability_usage').select('*').eq('game_id', gameRow.id),
-    sb.from('photo_requests').select('*').eq('game_id', gameRow.id),
+    sb.from('photo_requests').select('id, game_id, hunter_participant_id, target_participant_id, status, expires_at, submitted_at, photo_data_url').eq('game_id', gameRow.id),
     sb
       .from('sound_alerts')
       .select('*')
@@ -1657,13 +1890,16 @@ async function getSupabaseAuthorizedState(cleanCode: string, viewerId: string) {
     const remainingPhotoRequests = pr ? 0 : 1;
     if ((viewerRole === 'HUNTER' || isSelf) && pr) {
       const expMs = new Date(pr.expires_at).getTime();
+      const subMs = pr.submitted_at ? new Date(pr.submitted_at).getTime() : 0;
       const status = pr.status === 'PENDING' && now >= expMs ? 'EXPIRED' : pr.status;
+      const canViewPhoto = Boolean(pr.photo_data_url && (viewerRole === 'HUNTER' || isSelf));
+      const isNewPhoto = Boolean(canViewPhoto && (includeMedia || !sinceMs || (subMs && subMs >= sinceMs - 3500)));
       photoRequestView = {
         id: pr.id,
         status,
         expiresInSeconds: Math.max(0, Math.ceil((expMs - now) / 1000)),
-        hasPhoto: Boolean(pr.photo_data_url && (viewerRole === 'HUNTER' || isSelf)),
-        photoDataUrl: viewerRole === 'HUNTER' || isSelf ? pr.photo_data_url : null,
+        hasPhoto: canViewPhoto,
+        photoDataUrl: isNewPhoto ? pr.photo_data_url : null,
         remainingRequests: remainingPhotoRequests,
       };
     }
@@ -1710,7 +1946,8 @@ async function getSupabaseAuthorizedState(cleanCode: string, viewerId: string) {
   if (soundAlertsRows && soundAlertsRows[0]) {
     const a = soundAlertsRows[0];
     const createdMs = new Date(a.created_at).getTime();
-    if (now - createdMs < 15000) {
+    const cutoff = sinceMs > 0 ? Math.max(now - 15000, sinceMs - 3000) : now - 15000;
+    if (createdMs >= cutoff) {
       recentTargetedAlert = {
         id: a.id,
         hunterId: a.hunter_participant_id,
@@ -1753,6 +1990,7 @@ async function getSupabaseAuthorizedState(cleanCode: string, viewerId: string) {
     title: gameRow.title,
     state: currentState,
     storageMode: 'SUPABASE' as const,
+    serverTime: now,
     hostId: gameRow.host_participant_id,
     viewerId,
     viewerRole,

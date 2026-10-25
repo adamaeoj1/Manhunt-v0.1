@@ -1,20 +1,137 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { CreateGameSchema } from '@/lib/validation';
-import { createGameSession, getAuthorizedGameState } from '@/lib/game-engine';
+import {
+  CreateGameSchema,
+  JoinGameSchema,
+  GameActionSchema,
+  SubmitLocationSchema,
+} from '@/lib/validation';
+import {
+  createGameSession,
+  joinGameSession,
+  performGameAction,
+  submitParticipantGps,
+  getAuthorizedGameState,
+  normalizeRoomCode,
+} from '@/lib/game-engine';
 
 export const dynamic = 'force-dynamic';
+
+export async function GET(req: NextRequest) {
+  try {
+    const rawCode = req.nextUrl.searchParams.get('code') || '';
+    const cleanCode = normalizeRoomCode(rawCode);
+    const viewerId = (req.nextUrl.searchParams.get('participantId') || '').trim();
+    const sinceRaw = Number(req.nextUrl.searchParams.get('since') || '0');
+    const includeMedia = req.nextUrl.searchParams.get('includeMedia') === '1';
+
+    if (!cleanCode || !viewerId) {
+      return NextResponse.json(
+        { error: 'Both code and participantId query parameters are required.' },
+        { status: 400 }
+      );
+    }
+
+    const snapshot = await getAuthorizedGameState(cleanCode, viewerId, {
+      sinceMs: Number.isFinite(sinceRaw) ? sinceRaw : 0,
+      includeMedia,
+    });
+    return NextResponse.json({ snapshot });
+  } catch (err: any) {
+    return NextResponse.json(
+      { error: err?.message || 'Could not fetch game state.' },
+      { status: 404 }
+    );
+  }
+}
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
+    const op = typeof body?.op === 'string' ? body.op.toUpperCase() : 'CREATE';
+
+    if (op === 'JOIN') {
+      const cleanCode = normalizeRoomCode(body.code || '');
+      if (cleanCode.length !== 6) {
+        return NextResponse.json(
+          { error: 'Please enter a valid 6-character room code.' },
+          { status: 400 }
+        );
+      }
+      const parsed = JoinGameSchema.safeParse({ nickname: body.nickname });
+      if (!parsed.success) {
+        return NextResponse.json(
+          { error: parsed.error.issues[0]?.message || 'Invalid nickname.' },
+          { status: 400 }
+        );
+      }
+      const joined = await joinGameSession(cleanCode, parsed.data.nickname);
+      const snapshot = await getAuthorizedGameState(joined.code, joined.participantId, {
+        includeMedia: true,
+      });
+      return NextResponse.json({
+        code: joined.code,
+        participantId: joined.participantId,
+        storageMode: joined.storageMode,
+        snapshot,
+      });
+    }
+
+    if (op === 'ACTION') {
+      const cleanCode = normalizeRoomCode(body.code || '');
+      const { op: _op, code: _code, ...actionPayload } = body;
+      const parsed = GameActionSchema.safeParse(actionPayload);
+      if (!parsed.success) {
+        return NextResponse.json(
+          { error: parsed.error.issues[0]?.message || 'Invalid game action payload.' },
+          { status: 400 }
+        );
+      }
+      const result = await performGameAction(cleanCode, parsed.data);
+      const snapshot = await getAuthorizedGameState(cleanCode, parsed.data.participantId);
+      return NextResponse.json({ ...result, snapshot });
+    }
+
+    if (op === 'LOCATION') {
+      const cleanCode = normalizeRoomCode(body.code || '');
+      const { op: _op, code: _code, ...locPayload } = body;
+      const parsed = SubmitLocationSchema.safeParse(locPayload);
+      if (!parsed.success) {
+        return NextResponse.json(
+          { error: parsed.error.issues[0]?.message || 'Invalid GPS coordinates.' },
+          { status: 400 }
+        );
+      }
+      const result = await submitParticipantGps({ code: cleanCode, ...parsed.data });
+      const snapshot = await getAuthorizedGameState(cleanCode, parsed.data.participantId);
+      return NextResponse.json({
+        updatedAt: result.updatedAt,
+        boundaryCheck: result.boundaryCheck,
+        snapshot,
+      });
+    }
+
+    // Default: CREATE
     const parsed = CreateGameSchema.safeParse(body);
     if (!parsed.success) {
-      return NextResponse.json({ error: parsed.error.issues[0]?.message || 'Invalid game configuration.' }, { status: 400 });
+      return NextResponse.json(
+        { error: parsed.error.issues[0]?.message || 'Invalid game configuration.' },
+        { status: 400 }
+      );
     }
     const created = await createGameSession(parsed.data);
-    const snapshot = await getAuthorizedGameState(created.code, created.participantId);
-    return NextResponse.json({ code: created.code, participantId: created.participantId, storageMode: created.storageMode, snapshot });
+    const snapshot = await getAuthorizedGameState(created.code, created.participantId, {
+      includeMedia: true,
+    });
+    return NextResponse.json({
+      code: created.code,
+      participantId: created.participantId,
+      storageMode: created.storageMode,
+      snapshot,
+    });
   } catch (err: any) {
-    return NextResponse.json({ error: err?.message || 'Could not create game session.' }, { status: 400 });
+    return NextResponse.json(
+      { error: err?.message || 'Could not process game request.' },
+      { status: 400 }
+    );
   }
 }

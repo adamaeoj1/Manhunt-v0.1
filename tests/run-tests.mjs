@@ -61,15 +61,25 @@ function csprngAssignRoles(participantIds, hunterCount) {
   return roles;
 }
 
-const auiCenter = { lat: 33.5395, lng: -5.1058, radiusMeters: 260 };
+const auiPresets = {
+  main: { name: 'Full AUI Campus', lat: 33.53955, lng: -5.10685, radiusMeters: 390, zoom: 16 },
+  academic: { name: 'Academic Quad & Library', lat: 33.53965, lng: -5.1073, radiusMeters: 165, zoom: 17 },
+  housing: { name: 'Student Center & Dorms', lat: 33.54035, lng: -5.1062, radiusMeters: 195, zoom: 17 },
+  athletic: { name: 'Athletic Complex & Fields', lat: 33.53995, lng: -5.10865, radiusMeters: 160, zoom: 17 },
+};
+const auiCenter = auiPresets.main;
 assert.equal(calculateDistanceMeters(auiCenter.lat, auiCenter.lng, auiCenter.lat, auiCenter.lng), 0);
+assert.equal(auiPresets.main.radiusMeters, 390);
+assert.equal(auiPresets.academic.radiusMeters, 165);
+assert.equal(auiPresets.housing.radiusMeters, 195);
+assert.equal(auiPresets.athletic.radiusMeters, 160);
 
 // Boundary check tests
-const insideCheck = evaluatePlayBoundary(33.5395, -5.1058, auiCenter);
+const insideCheck = evaluatePlayBoundary(33.53955, -5.10685, auiCenter);
 assert.equal(insideCheck.isOutside, false);
 assert.equal(insideCheck.outsideMeters, 0);
 
-const outsideCheck = evaluatePlayBoundary(33.5435, -5.1058, auiCenter);
+const outsideCheck = evaluatePlayBoundary(33.5455, -5.10685, auiCenter);
 assert.equal(outsideCheck.isOutside, true);
 assert.ok(outsideCheck.outsideMeters > 0);
 

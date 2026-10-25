@@ -9,10 +9,13 @@ export type HunterVisibilityMode = 'ALWAYS_LIVE' | 'RADAR_PING_15S' | 'HIDDEN';
 export type TauntType = 'CATCH_ME' | 'I_SEE_YOU' | 'AIRHORN' | 'TOO_SLOW';
 
 export const AUI_CAMPUS_PRESETS = {
-  main: { name: 'Full AUI Campus', lat: 33.5395, lng: -5.1058, radiusMeters: 260 },
-  academic: { name: 'Academic Quad & Library', lat: 33.5401, lng: -5.1064, radiusMeters: 160 },
-  housing: { name: 'Student Center & Dorms', lat: 33.5387, lng: -5.1049, radiusMeters: 200 },
+  main: { name: 'Full AUI Campus', lat: 33.53955, lng: -5.10685, radiusMeters: 390, zoom: 16 },
+  academic: { name: 'Academic Quad & Library', lat: 33.53965, lng: -5.1073, radiusMeters: 165, zoom: 17 },
+  housing: { name: 'Student Center & Dorms', lat: 33.54035, lng: -5.1062, radiusMeters: 195, zoom: 17 },
+  athletic: { name: 'Athletic Complex & Fields', lat: 33.53995, lng: -5.10865, radiusMeters: 160, zoom: 17 },
 } as const;
+
+export type CampusPresetKey = keyof typeof AUI_CAMPUS_PRESETS;
 
 export const NicknameSchema = z
   .string()
@@ -49,7 +52,7 @@ export const CreateGameSchema = z.object({
   boundary: z.object({
     lat: z.coerce.number().min(-90).max(90),
     lng: z.coerce.number().min(-180).max(180),
-    radiusMeters: z.coerce.number().int().min(80).max(1500).default(260),
+    radiusMeters: z.coerce.number().int().min(80).max(1500).default(390),
   }),
 });
 

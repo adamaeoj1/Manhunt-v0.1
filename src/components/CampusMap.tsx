@@ -23,7 +23,19 @@ interface CampusMapProps {
   fitBoundaryCommand?: number;
 }
 
-export default function CampusMap({
+interface CachedMarkerEntry {
+  marker: any;
+  circle: any;
+  lastDisplayLat: number;
+  lastDisplayLng: number;
+  lastRawLat: number;
+  lastRawLng: number;
+  lastAccuracy: number;
+  lastIconSig: string;
+  lastZOffset: number;
+}
+
+function CampusMapInner({
   mode,
   boundary,
   markers = [],
@@ -33,9 +45,12 @@ export default function CampusMap({
 }: CampusMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
+  const leafletRef = useRef<any>(null);
   const boundaryCircleRef = useRef<any>(null);
   const setupCenterMarkerRef = useRef<any>(null);
-  const markersMapRef = useRef<Map<string, { marker: any; circle: any }>>(new Map());
+  const markersMapRef = useRef<Map<string, CachedMarkerEntry>>(new Map());
+  const lastCenterTsRef = useRef<number>(0);
+  const lastFitCmdRef = useRef<number>(0);
 
   const onSetupBoundaryMoveRef = useRef<CampusMapProps['onSetupBoundaryMove']>(onSetupBoundaryMove);
 
@@ -59,12 +74,14 @@ export default function CampusMap({
       if (!containerRef.current || mapRef.current) return;
       const L = (await import('leaflet')).default;
       if (!isMounted || !containerRef.current) return;
+      leafletRef.current = L;
 
+      const initialZoom = boundary.radiusMeters >= 320 ? 16 : 16;
       const map = L.map(containerRef.current, {
         zoomControl: mode === 'setup',
         scrollWheelZoom: mode === 'gameplay',
         attributionControl: true,
-      }).setView([boundary.lat, boundary.lng], 16);
+      }).setView([boundary.lat, boundary.lng], initialZoom);
 
       if (mode === 'gameplay') {
         L.control.zoom({ position: 'bottomleft' }).addTo(map);
@@ -156,12 +173,18 @@ export default function CampusMap({
 
   useEffect(() => {
     if (!mapRef.current || !centerCommand) return;
+    if (centerCommand.ts === lastCenterTsRef.current) return;
+    lastCenterTsRef.current = centerCommand.ts;
     mapRef.current.invalidateSize({ animate: false });
-    mapRef.current.flyTo([centerCommand.lat, centerCommand.lng], centerCommand.zoom || 17, { duration: 0.4 });
+    mapRef.current.flyTo([centerCommand.lat, centerCommand.lng], centerCommand.zoom || 17, {
+      duration: 0.55,
+    });
   }, [centerCommand]);
 
   useEffect(() => {
     if (!mapRef.current || !boundaryCircleRef.current || !fitBoundaryCommand) return;
+    if (fitBoundaryCommand === lastFitCmdRef.current) return;
+    lastFitCmdRef.current = fitBoundaryCommand;
     mapRef.current.invalidateSize({ animate: false });
     mapRef.current.fitBounds(boundaryCircleRef.current.getBounds(), { padding: [24, 24] });
   }, [fitBoundaryCommand]);
@@ -169,8 +192,11 @@ export default function CampusMap({
   useEffect(() => {
     async function syncMarkers() {
       if (mode !== 'gameplay' || !mapRef.current) return;
-      const L = (await import('leaflet')).default;
+      const L = leafletRef.current || (await import('leaflet')).default;
+      leafletRef.current = L;
       const map = mapRef.current;
+      if (!map) return;
+
       const activeIds = new Set<string>();
 
       // Compute spiderfy/offset positions when multiple players share nearly identical coordinates
@@ -217,39 +243,44 @@ export default function CampusMap({
         const pinBg = isHunter ? '#DC2626' : '#15803D';
         const badgeBg = isHunter ? '#991B1B' : '#14532D';
         const roleLabel = isHunter ? 'HUNTER' : 'HIDER';
-        const selfBadge = m.isSelf
-          ? `<span style="background:#2563EB;color:#FFFFFF;padding:1px 5px;border-radius:5px;font-weight:800;font-size:9px;margin-right:3px;">YOU</span>`
-          : '';
-        const roleBadge = `<span style="background:${badgeBg};color:#FFFFFF;padding:1px 5px;border-radius:5px;font-weight:800;font-size:9px;margin-right:4px;">${roleLabel}</span>`;
-        const selfRingStyle = m.isSelf
-          ? 'border:3px solid #FFFFFF; box-shadow: 0 0 0 4px #2563EB, 0 0 14px rgba(37,99,235,0.75);'
-          : isHunter
-          ? 'border:3px solid #FEE2E2; box-shadow: 0 0 0 2px #991B1B, 0 3px 10px rgba(0,0,0,0.35);'
-          : 'border:3px solid #DCFCE7; box-shadow: 0 0 0 2px #14532D, 0 3px 10px rgba(0,0,0,0.3);';
         const ageText = m.isStale ? `Stale ${m.ageSeconds}s` : `${m.ageSeconds}s`;
-
-        const html = `
-          <div style="position:relative; width:40px; height:40px;">
-            ${
-              m.isSelf
-                ? `<div style="position:absolute; inset:-6px; border-radius:9999px; border:2.5px solid #3B82F6; opacity:0.75; pointer-events:none;"></div>`
-                : ''
-            }
-            <div class="campus-marker-pin" style="width:40px; height:40px; background:${pinBg}; ${selfRingStyle} opacity:${
-          m.isStale ? '0.68' : '1'
-        }; font-size:13px;">
-              ${m.nickname.slice(0, 2).toUpperCase()}
-            </div>
-            <div class="marker-label-pill" style="display:flex; align-items:center; gap:2px;">
-              ${selfBadge}${roleBadge}<span>${m.nickname} (±${m.accuracy}m • ${ageText})</span>
-            </div>
-          </div>
-        `;
-
-        const icon = L.divIcon({ html, className: '', iconSize: [40, 40], iconAnchor: [20, 20] });
         const zOffset = m.isSelf ? 1000 : isHunter ? 500 : 100;
+        const iconSig = `${m.nickname}|${m.role}|${m.isSelf}|${m.accuracy}|${m.isStale}|${ageText}`;
+
+        const buildIcon = () => {
+          const selfBadge = m.isSelf
+            ? `<span style="background:#2563EB;color:#FFFFFF;padding:1px 5px;border-radius:5px;font-weight:800;font-size:9px;margin-right:3px;">YOU</span>`
+            : '';
+          const roleBadge = `<span style="background:${badgeBg};color:#FFFFFF;padding:1px 5px;border-radius:5px;font-weight:800;font-size:9px;margin-right:4px;">${roleLabel}</span>`;
+          const selfRingStyle = m.isSelf
+            ? 'border:3px solid #FFFFFF; box-shadow: 0 0 0 4px #2563EB, 0 0 14px rgba(37,99,235,0.75);'
+            : isHunter
+            ? 'border:3px solid #FEE2E2; box-shadow: 0 0 0 2px #991B1B, 0 3px 10px rgba(0,0,0,0.35);'
+            : 'border:3px solid #DCFCE7; box-shadow: 0 0 0 2px #14532D, 0 3px 10px rgba(0,0,0,0.3);';
+
+          const html = `
+            <div style="position:relative; width:40px; height:40px;">
+              ${
+                m.isSelf
+                  ? `<div style="position:absolute; inset:-6px; border-radius:9999px; border:2.5px solid #3B82F6; opacity:0.75; pointer-events:none;"></div>`
+                  : ''
+              }
+              <div class="campus-marker-pin" style="width:40px; height:40px; background:${pinBg}; ${selfRingStyle} opacity:${
+            m.isStale ? '0.68' : '1'
+          }; font-size:13px;">
+                ${m.nickname.slice(0, 2).toUpperCase()}
+              </div>
+              <div class="marker-label-pill" style="display:flex; align-items:center; gap:2px;">
+                ${selfBadge}${roleBadge}<span>${m.nickname} (±${m.accuracy}m • ${ageText})</span>
+              </div>
+            </div>
+          `;
+          return L.divIcon({ html, className: '', iconSize: [40, 40], iconAnchor: [20, 20] });
+        };
+
         const existing = markersMapRef.current.get(m.id);
         if (!existing) {
+          const icon = buildIcon();
           const marker = L.marker([pos.lat, pos.lng], { icon, zIndexOffset: zOffset }).addTo(map);
           const circle = L.circle([m.lat, m.lng], {
             radius: m.accuracy,
@@ -259,15 +290,40 @@ export default function CampusMap({
             fillOpacity: 0.1,
             interactive: false,
           }).addTo(map);
-          markersMapRef.current.set(m.id, { marker, circle });
+          markersMapRef.current.set(m.id, {
+            marker,
+            circle,
+            lastDisplayLat: pos.lat,
+            lastDisplayLng: pos.lng,
+            lastRawLat: m.lat,
+            lastRawLng: m.lng,
+            lastAccuracy: m.accuracy,
+            lastIconSig: iconSig,
+            lastZOffset: zOffset,
+          });
         } else {
-          existing.marker.setLatLng([pos.lat, pos.lng]);
-          existing.marker.setIcon(icon);
-          if (existing.marker.setZIndexOffset) {
-            existing.marker.setZIndexOffset(zOffset);
+          if (existing.lastDisplayLat !== pos.lat || existing.lastDisplayLng !== pos.lng) {
+            existing.marker.setLatLng([pos.lat, pos.lng]);
+            existing.lastDisplayLat = pos.lat;
+            existing.lastDisplayLng = pos.lng;
           }
-          existing.circle.setLatLng([m.lat, m.lng]);
-          existing.circle.setRadius(m.accuracy);
+          if (existing.lastIconSig !== iconSig) {
+            existing.marker.setIcon(buildIcon());
+            existing.lastIconSig = iconSig;
+          }
+          if (existing.lastZOffset !== zOffset && existing.marker.setZIndexOffset) {
+            existing.marker.setZIndexOffset(zOffset);
+            existing.lastZOffset = zOffset;
+          }
+          if (existing.lastRawLat !== m.lat || existing.lastRawLng !== m.lng) {
+            existing.circle.setLatLng([m.lat, m.lng]);
+            existing.lastRawLat = m.lat;
+            existing.lastRawLng = m.lng;
+          }
+          if (existing.lastAccuracy !== m.accuracy) {
+            existing.circle.setRadius(m.accuracy);
+            existing.lastAccuracy = m.accuracy;
+          }
         }
       }
 
@@ -290,3 +346,6 @@ export default function CampusMap({
     />
   );
 }
+
+const CampusMap = React.memo(CampusMapInner);
+export default CampusMap;
