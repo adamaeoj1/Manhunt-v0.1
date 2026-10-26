@@ -1,8 +1,3 @@
--- ============================================================================
--- AUI CAMPUS MANHUNT (AL AKHAWAYN UNIVERSITY, IFRANE)
--- Production PostgreSQL Schema, Secret Role Isolation & Row Level Security
--- ============================================================================
-
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 CREATE TABLE IF NOT EXISTS public.games (

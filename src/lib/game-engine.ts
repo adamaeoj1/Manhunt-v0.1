@@ -98,6 +98,27 @@ export interface CaptureLogRecord {
   capturedAt: number;
 }
 
+export type GameEventType =
+  | 'NOTE'
+  | 'TAUNT'
+  | 'SOUND_ALERT'
+  | 'PHOTO_REQUEST'
+  | 'PHOTO_SUBMITTED'
+  | 'CAPTURE'
+  | 'CLOAK'
+  | 'WALKIE'
+  | 'SYSTEM';
+
+export interface GameEventRecord {
+  id: string;
+  type: GameEventType;
+  senderId: string;
+  senderName: string;
+  senderRole: PlayerRole | null;
+  message: string;
+  createdAt: number;
+}
+
 export interface GameRecord {
   id: string;
   code: string;
@@ -138,6 +159,7 @@ export interface GameRecord {
   walkieMessages: WalkieTalkieMessageRecord[];
   tauntAlerts: TauntAlertRecord[];
   capturesLog: CaptureLogRecord[];
+  events: GameEventRecord[];
   tauntCooldownByParticipant: Map<string, number>;
   photoRequestsByHider: Map<string, PhotoRequestRecord>;
   photoRequestCountByHider: Map<string, number>;
@@ -190,6 +212,7 @@ interface SerializedGameRecord {
   walkieMessages: WalkieTalkieMessageRecord[];
   tauntAlerts: TauntAlertRecord[];
   capturesLog: CaptureLogRecord[];
+  events?: GameEventRecord[];
   tauntCooldownByParticipant: Array<[string, number]>;
   photoRequestsByHider: Array<[string, PhotoRequestRecord]>;
   photoRequestCountByHider: Array<[string, number]>;
@@ -221,6 +244,7 @@ function serializeGameRecord(game: GameRecord): SerializedGameRecord {
     walkieMessages: game.walkieMessages,
     tauntAlerts: game.tauntAlerts,
     capturesLog: game.capturesLog,
+    events: game.events || [],
     tauntCooldownByParticipant: Array.from(game.tauntCooldownByParticipant.entries()),
     photoRequestsByHider: Array.from(game.photoRequestsByHider.entries()),
     photoRequestCountByHider: Array.from(game.photoRequestCountByHider.entries()),
@@ -253,6 +277,7 @@ function deserializeGameRecord(raw: SerializedGameRecord): GameRecord {
     walkieMessages: raw.walkieMessages || [],
     tauntAlerts: raw.tauntAlerts || [],
     capturesLog: raw.capturesLog || [],
+    events: raw.events || [],
     tauntCooldownByParticipant: new Map(raw.tauntCooldownByParticipant || []),
     photoRequestsByHider: new Map(raw.photoRequestsByHider || []),
     photoRequestCountByHider: new Map(raw.photoRequestCountByHider || []),
@@ -260,6 +285,34 @@ function deserializeGameRecord(raw: SerializedGameRecord): GameRecord {
     ghostCloakByHider: new Map(raw.ghostCloakByHider || []),
     catchPinsByHider: new Map(raw.catchPinsByHider || []),
   };
+}
+
+function appendGameEvent(
+  game: GameRecord,
+  event: {
+    id?: string;
+    type: GameEventType;
+    senderId: string;
+    senderName: string;
+    senderRole: PlayerRole | null;
+    message: string;
+    createdAt?: number;
+  }
+): GameEventRecord {
+  if (!Array.isArray(game.events)) {
+    game.events = [];
+  }
+  const record: GameEventRecord = {
+    id: event.id || generateSecureId('evt'),
+    type: event.type,
+    senderId: event.senderId,
+    senderName: event.senderName,
+    senderRole: event.senderRole,
+    message: event.message,
+    createdAt: event.createdAt || Date.now(),
+  };
+  game.events = [...game.events.slice(-39), record];
+  return record;
 }
 
 function getRoomFilePath(cleanCode: string): string {
@@ -544,6 +597,7 @@ export async function createGameSession(input: {
     walkieMessages: [],
     tauntAlerts: [],
     capturesLog: [],
+    events: [],
     tauntCooldownByParticipant: new Map(),
     photoRequestsByHider: new Map(),
     photoRequestCountByHider: new Map(),
@@ -568,8 +622,66 @@ export async function createGameSession(input: {
     joinedAt: now,
   });
 
+  appendGameEvent(game, {
+    type: 'SYSTEM',
+    senderId: hostId,
+    senderName: cleanHostNickname,
+    senderRole: null,
+    message: `🏁 Lobby "${game.title}" created by ${cleanHostNickname}.`,
+    createdAt: now,
+  });
+
   saveRoomToSharedStore(game);
   return { code, participantId: hostId, storageMode: 'LOCAL_MEMORY' as const };
+}
+
+export async function getRoomPreview(code: string) {
+  const cleanCode = normalizeRoomCode(code);
+  if (cleanCode.length !== 6) return null;
+
+  const localGame = loadRoomFromSharedStore(cleanCode);
+  if (localGame) {
+    tickLocalLifecycle(localGame);
+    const host = localGame.participants.get(localGame.hostId);
+    return {
+      code: localGame.code,
+      title: localGame.title,
+      state: localGame.state,
+      hostNickname: host?.nickname || 'Host',
+      playerCount: localGame.participants.size,
+      maxPlayers: localGame.settings.maxPlayers,
+      hunterCount: localGame.settings.hunterCount,
+      durationMinutes: localGame.settings.durationMinutes,
+      countdownSeconds: localGame.settings.countdownSeconds,
+      radiusMeters: localGame.settings.boundary.radiusMeters,
+    };
+  }
+
+  if (isSupabaseConfigured()) {
+    try {
+      const sb = getSupabaseAdminClient();
+      const { data: gameRow } = await sb.from('games').select('*').eq('code', cleanCode).maybeSingle();
+      if (gameRow) {
+        const { data: existingPlayers } = await sb.from('participants').select('nickname, is_host').eq('game_id', gameRow.id);
+        const list = existingPlayers || [];
+        const host = list.find((p) => p.is_host);
+        return {
+          code: gameRow.code,
+          title: gameRow.title || 'AUI Campus Manhunt',
+          state: gameRow.state as GameState,
+          hostNickname: host?.nickname || 'Host',
+          playerCount: list.length,
+          maxPlayers: 12,
+          hunterCount: gameRow.hunter_count || 1,
+          durationMinutes: gameRow.duration_minutes || 20,
+          countdownSeconds: gameRow.countdown_seconds || 10,
+          radiusMeters: gameRow.boundary_radius_m || 390,
+        };
+      }
+    } catch {}
+  }
+
+  return null;
 }
 
 export async function joinGameSession(code: string, nickname: string) {
@@ -915,6 +1027,18 @@ export async function performGameAction(code: string, payload: Record<string, un
         game.countdownEndsAt = now;
         game.endsAt = now + game.settings.durationMinutes * 60 * 1000;
       }
+      game.events = [];
+      appendGameEvent(game, {
+        type: 'SYSTEM',
+        senderId: participantId,
+        senderName: actor.nickname,
+        senderRole: game.secretRoles.get(participantId) || null,
+        message:
+          countdownMs > 0
+            ? `🚀 Round started! Hiders have ${game.settings.countdownSeconds}s head-start to hide!`
+            : '🚀 Round started! The Hunt is LIVE on campus!',
+        createdAt: now,
+      });
       saveRoomToSharedStore(game);
       return { ok: true };
     }
@@ -956,6 +1080,14 @@ export async function performGameAction(code: string, payload: Record<string, un
         maxUses,
         activeUntil,
       });
+      appendGameEvent(game, {
+        type: 'CLOAK',
+        senderId: participantId,
+        senderName: actor.nickname,
+        senderRole: 'HIDER',
+        message: `👻 ${actor.nickname} activated Ghost Cloak (location hidden for 60s)!`,
+        createdAt: now,
+      });
       saveRoomToSharedStore(game);
       return { ok: true, activeUntil, remainingUses: Math.max(0, maxUses - (existing.usedCount + 1)) };
     }
@@ -983,6 +1115,14 @@ export async function performGameAction(code: string, payload: Record<string, un
         .filter((m) => now - m.createdAt < 25000)
         .slice(-5);
       game.walkieMessages.push(msg);
+      appendGameEvent(game, {
+        type: 'WALKIE',
+        senderId: participantId,
+        senderName: actor.nickname,
+        senderRole: game.secretRoles.get(participantId) || null,
+        message: `📻 ${actor.nickname} sent a Walkie-Talkie radio transmission (${durationSeconds}s${disguised ? ', disguised' : ''}).`,
+        createdAt: now,
+      });
       saveRoomToSharedStore(game);
       return { ok: true, messageId: msg.id };
     }
@@ -1011,8 +1151,44 @@ export async function performGameAction(code: string, payload: Record<string, un
       };
       game.tauntAlerts = game.tauntAlerts.filter((t) => now - t.createdAt < 20000).slice(-10);
       game.tauntAlerts.push(taunt);
+
+      const tauntTextMap: Record<TauntType, string> = {
+        CATCH_ME: '😂 Catch Me If You Can!',
+        I_SEE_YOU: '👀 I See You!',
+        AIRHORN: '📯 Airhorn Taunt!',
+        TOO_SLOW: '👻 Too Slow!',
+      };
+      appendGameEvent(game, {
+        id: taunt.id,
+        type: 'TAUNT',
+        senderId: participantId,
+        senderName: actor.nickname,
+        senderRole: game.secretRoles.get(participantId) || null,
+        message: tauntTextMap[tauntType],
+        createdAt: now,
+      });
       saveRoomToSharedStore(game);
       return { ok: true, tauntId: taunt.id };
+    }
+    case 'SEND_NOTE': {
+      const rawMessage = String(payload.message || '').trim();
+      if (!rawMessage) {
+        throw new Error('Note message cannot be empty.');
+      }
+      if (rawMessage.length > 160) {
+        throw new Error('Note message cannot exceed 160 characters.');
+      }
+      const now = Date.now();
+      const noteEvt = appendGameEvent(game, {
+        type: 'NOTE',
+        senderId: participantId,
+        senderName: actor.nickname,
+        senderRole: game.secretRoles.get(participantId) || null,
+        message: rawMessage,
+        createdAt: now,
+      });
+      saveRoomToSharedStore(game);
+      return { ok: true, eventId: noteEvt.id };
     }
     case 'SEND_SOUND': {
       if (game.state !== 'ACTIVE') throw new Error('Sound alerts require an active game.');
@@ -1048,6 +1224,15 @@ export async function performGameAction(code: string, payload: Record<string, un
         createdAt: now,
       };
       game.soundAlerts.push(alertRecord);
+      appendGameEvent(game, {
+        id: alertRecord.id,
+        type: 'SOUND_ALERT',
+        senderId: participantId,
+        senderName: actor.nickname,
+        senderRole: 'HUNTER',
+        message: `🚨 Triggered a 4-second Siren Alert on ${target.nickname}’s phone!`,
+        createdAt: now,
+      });
       saveRoomToSharedStore(game);
       return { ok: true, deliveryStatus, alertId: alertRecord.id };
     }
@@ -1084,6 +1269,15 @@ export async function performGameAction(code: string, payload: Record<string, un
       };
       game.photoRequestsByHider.set(targetHiderId, req);
       game.photoRequestCountByHider.set(targetHiderId, usedCount + 1);
+      appendGameEvent(game, {
+        id: req.id,
+        type: 'PHOTO_REQUEST',
+        senderId: participantId,
+        senderName: actor.nickname,
+        senderRole: 'HUNTER',
+        message: `📷 Requested a surroundings photo from ${target.nickname} (90s timer)!`,
+        createdAt: now,
+      });
       saveRoomToSharedStore(game);
       return { ok: true, photoRequestId: req.id };
     }
@@ -1093,6 +1287,13 @@ export async function performGameAction(code: string, payload: Record<string, un
       if (req.status !== 'PENDING') throw new Error(`This photo request is already ${req.status.toLowerCase()}.`);
       if (payload.declined) {
         req.status = 'DECLINED';
+        appendGameEvent(game, {
+          type: 'PHOTO_SUBMITTED',
+          senderId: participantId,
+          senderName: actor.nickname,
+          senderRole: 'HIDER',
+          message: `📷 ${actor.nickname} declined the surroundings photo request.`,
+        });
         saveRoomToSharedStore(game);
         return { ok: true };
       }
@@ -1101,6 +1302,14 @@ export async function performGameAction(code: string, payload: Record<string, un
       req.status = 'SUBMITTED';
       req.photoDataUrl = dataUrl;
       req.submittedAt = Date.now();
+      appendGameEvent(game, {
+        type: 'PHOTO_SUBMITTED',
+        senderId: participantId,
+        senderName: actor.nickname,
+        senderRole: 'HIDER',
+        message: `📷 ${actor.nickname} submitted a surroundings photo to Hunters!`,
+        createdAt: req.submittedAt,
+      });
       saveRoomToSharedStore(game);
       return { ok: true };
     }
@@ -1146,18 +1355,31 @@ export async function performGameAction(code: string, payload: Record<string, un
         }
       }
 
+      const capturedAt = Date.now();
       target.status = 'CAPTURED';
       target.capturedByNickname = isSelf ? 'Self-reported' : actor.nickname;
       if (!isSelf) {
         actor.capturesCount = (actor.capturesCount || 0) + 1;
       }
+      const capId = generateSecureId('cap');
       game.capturesLog.push({
-        id: generateSecureId('cap'),
+        id: capId,
         hunterId: actor.id,
         hunterNickname: isSelf ? 'Self-reported' : actor.nickname,
         hiderId: target.id,
         hiderNickname: target.nickname,
-        capturedAt: Date.now(),
+        capturedAt,
+      });
+      appendGameEvent(game, {
+        id: capId,
+        type: 'CAPTURE',
+        senderId: actor.id,
+        senderName: actor.nickname,
+        senderRole: game.secretRoles.get(actor.id) || null,
+        message: isSelf
+          ? `🎯 ${target.nickname} reported themselves caught!`
+          : `🎯 ${actor.nickname} caught ${target.nickname} on campus!`,
+        createdAt: capturedAt,
       });
       game.locations.delete(targetHiderId);
       game.outsideSinceByParticipant.delete(targetHiderId);
@@ -1200,6 +1422,7 @@ export async function performGameAction(code: string, payload: Record<string, un
       game.walkieMessages = [];
       game.tauntAlerts = [];
       game.capturesLog = [];
+      game.events = [];
       game.tauntCooldownByParticipant.clear();
       game.photoRequestsByHider.clear();
       game.photoRequestCountByHider.clear();
@@ -1499,6 +1722,12 @@ async function performSupabaseGameAction(
         .eq('id', gameRow.id);
       return { ok: true };
     }
+    case 'SEND_NOTE':
+    case 'SEND_TAUNT':
+    case 'SEND_WALKIE_TALKIE':
+    case 'ACTIVATE_GHOST_CLOAK': {
+      return { ok: true };
+    }
     case 'REMATCH': {
       if (gameRow.host_participant_id !== participantId) throw new Error('Only the host can start a rematch.');
       await sb.from('participant_roles').delete().eq('game_id', gameRow.id);
@@ -1746,6 +1975,10 @@ export async function getAuthorizedGameState(
     state: game.state,
     storageMode: 'LOCAL_MEMORY' as const,
     serverTime: now,
+    serverNowMs: now,
+    headStartEndsAtMs: game.countdownEndsAt,
+    gameEndsAtMs: game.endsAt,
+    pausedRemainingMs: game.pausedRemainingMs,
     hostId: game.hostId,
     viewerId,
     viewerRole,
@@ -1769,6 +2002,7 @@ export async function getAuthorizedGameState(
     winnerTeam: game.winnerTeam,
     winReason: game.winReason,
     capturesLog: game.capturesLog,
+    events: (game.events || []).slice(-30),
     soundAbility: soundAbilityView,
     recentTargetedAlert,
     recentWalkieMessages,
@@ -1991,6 +2225,10 @@ async function getSupabaseAuthorizedState(
     state: currentState,
     storageMode: 'SUPABASE' as const,
     serverTime: now,
+    serverNowMs: now,
+    headStartEndsAtMs: countdownEndsMs,
+    gameEndsAtMs: endsMs,
+    pausedRemainingMs: gameRow.paused_remaining_ms ?? null,
     hostId: gameRow.host_participant_id,
     viewerId,
     viewerRole,
@@ -2036,6 +2274,7 @@ async function getSupabaseAuthorizedState(
     winnerTeam: gameRow.winner_team,
     winReason: gameRow.win_reason,
     capturesLog: [] as CaptureLogRecord[],
+    events: [] as GameEventRecord[],
     soundAbility: soundAbilityView,
     recentTargetedAlert,
     recentWalkieMessages: [] as WalkieTalkieMessageRecord[],

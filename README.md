@@ -1,4 +1,4 @@
-# AUI Campus Manhunt — Al Akhawayn University (Ifrane, Morocco)
+# AUI Campus Manhunt
 
 Find your friends. Don't get caught.
 

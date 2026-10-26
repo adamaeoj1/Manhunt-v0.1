@@ -7,10 +7,57 @@
  */
 class ManhuntSoundEngine {
   private ctx: AudioContext | null = null;
+  private masterGain: GainNode | null = null;
   private unlocked = false;
+  private autoUnlockBound = false;
+
+  constructor() {
+    if (typeof window !== 'undefined') {
+      this.registerGlobalAutoUnlock();
+    }
+  }
+
+  /**
+   * Registers global first-interaction listeners (pointerdown, touchstart, click, keydown)
+   * so that the very first touch/click anywhere on the page creates & resumes the shared AudioContext.
+   */
+  public registerGlobalAutoUnlock(): void {
+    if (typeof window === 'undefined' || this.autoUnlockBound) return;
+    this.autoUnlockBound = true;
+
+    const unlockHandler = () => {
+      try {
+        const ctx = this.getOrCreateContext();
+        if (!ctx) return;
+        if (ctx.state === 'suspended') {
+          ctx.resume().catch(() => {});
+        }
+        if (!this.unlocked) {
+          const buffer = ctx.createBuffer(1, 1, 22050);
+          const source = ctx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(this.getDestination(ctx));
+          source.start(0);
+          this.unlocked = true;
+        }
+        if (ctx.state === 'running') {
+          window.removeEventListener('pointerdown', unlockHandler, true);
+          window.removeEventListener('touchstart', unlockHandler, true);
+          window.removeEventListener('click', unlockHandler, true);
+          window.removeEventListener('keydown', unlockHandler, true);
+        }
+      } catch {}
+    };
+
+    window.addEventListener('pointerdown', unlockHandler, { capture: true, passive: true });
+    window.addEventListener('touchstart', unlockHandler, { capture: true, passive: true });
+    window.addEventListener('click', unlockHandler, { capture: true, passive: true });
+    window.addEventListener('keydown', unlockHandler, { capture: true, passive: true });
+  }
 
   private getOrCreateContext(): AudioContext | null {
     if (typeof window === 'undefined') return null;
+    this.registerGlobalAutoUnlock();
     if (!this.ctx) {
       const AudioCtx =
         window.AudioContext ||
@@ -24,8 +71,41 @@ class ManhuntSoundEngine {
     return this.ctx;
   }
 
+  private async ensureContextRunning(): Promise<AudioContext | null> {
+    const ctx = this.getOrCreateContext();
+    if (!ctx) return null;
+    if (ctx.state === 'suspended') {
+      try {
+        await ctx.resume();
+      } catch {}
+    }
+    this.unlocked = true;
+    return ctx;
+  }
+
+  private getDestination(ctx: AudioContext): AudioNode {
+    if (!this.masterGain || this.masterGain.context !== ctx) {
+      try {
+        const compressor = ctx.createDynamicsCompressor();
+        compressor.threshold.setValueAtTime(-14, ctx.currentTime);
+        compressor.knee.setValueAtTime(18, ctx.currentTime);
+        compressor.ratio.setValueAtTime(4, ctx.currentTime);
+        compressor.attack.setValueAtTime(0.003, ctx.currentTime);
+        compressor.release.setValueAtTime(0.15, ctx.currentTime);
+
+        this.masterGain = ctx.createGain();
+        this.masterGain.gain.setValueAtTime(1.35, ctx.currentTime);
+        this.masterGain.connect(compressor);
+        compressor.connect(ctx.destination);
+      } catch {
+        return ctx.destination;
+      }
+    }
+    return this.masterGain;
+  }
+
   public isUnlocked(): boolean {
-    return this.unlocked && Boolean(this.ctx && this.ctx.state === 'running');
+    return this.unlocked || Boolean(this.ctx && this.ctx.state === 'running');
   }
 
   /**
@@ -36,12 +116,15 @@ class ManhuntSoundEngine {
     try {
       const ctx = this.getOrCreateContext();
       if (!ctx) return false;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
 
       // Play a 1-frame silent buffer first to unlock iOS Safari audio hardware
       const buffer = ctx.createBuffer(1, 1, 22050);
       const source = ctx.createBufferSource();
       source.buffer = buffer;
-      source.connect(ctx.destination);
+      source.connect(this.getDestination(ctx));
       source.start(0);
 
       this.unlocked = true;
@@ -59,6 +142,10 @@ class ManhuntSoundEngine {
     try {
       const ctx = this.getOrCreateContext();
       if (!ctx) return false;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const dest = this.getDestination(ctx);
 
       const now = ctx.currentTime;
       const notes = [523.25, 659.25, 783.99, 1046.5];
@@ -72,16 +159,59 @@ class ManhuntSoundEngine {
         osc.frequency.setValueAtTime(freq, start);
 
         gain.gain.setValueAtTime(0.001, start);
-        gain.gain.linearRampToValueAtTime(0.45, start + 0.02);
+        gain.gain.linearRampToValueAtTime(0.65, start + 0.02);
         gain.gain.exponentialRampToValueAtTime(0.001, start + duration);
 
         osc.connect(gain);
-        gain.connect(ctx.destination);
+        gain.connect(dest);
         osc.start(start);
         osc.stop(start + duration);
       });
 
       this.vibrate([80]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Live Note / Activity Alert Chime:
+   * Crisp two-tone tactical notification ping played when a new note or game event arrives.
+   */
+  public playNoteAlertChime(): boolean {
+    try {
+      const ctx = this.getOrCreateContext();
+      if (!ctx) return false;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const dest = this.getDestination(ctx);
+
+      const now = ctx.currentTime;
+      const notes = [
+        { freq: 659.25, offset: 0, dur: 0.13 },
+        { freq: 987.77, offset: 0.14, dur: 0.22 },
+      ];
+      notes.forEach(({ freq, offset, dur }) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        const start = now + offset;
+
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(freq, start);
+
+        gain.gain.setValueAtTime(0.001, start);
+        gain.gain.linearRampToValueAtTime(0.62, start + 0.018);
+        gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
+
+        osc.connect(gain);
+        gain.connect(dest);
+        osc.start(start);
+        osc.stop(start + dur);
+      });
+
+      this.vibrate([100, 50, 120]);
       return true;
     } catch {
       return false;
@@ -97,6 +227,10 @@ class ManhuntSoundEngine {
     try {
       const ctx = this.getOrCreateContext();
       if (!ctx) return false;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const dest = this.getDestination(ctx);
 
       const now = ctx.currentTime;
       const osc = ctx.createOscillator();
@@ -125,13 +259,13 @@ class ManhuntSoundEngine {
       }
 
       gain.gain.setValueAtTime(0.001, now);
-      gain.gain.linearRampToValueAtTime(0.65, now + 0.05);
-      gain.gain.setValueAtTime(0.65, Math.max(now + 0.06, now + durationSeconds - 0.15));
+      gain.gain.linearRampToValueAtTime(0.85, now + 0.05);
+      gain.gain.setValueAtTime(0.85, Math.max(now + 0.06, now + durationSeconds - 0.15));
       gain.gain.exponentialRampToValueAtTime(0.001, now + durationSeconds);
 
       osc.connect(gain);
       subOsc.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(dest);
 
       osc.start(now);
       subOsc.start(now);
@@ -145,6 +279,10 @@ class ManhuntSoundEngine {
     }
   }
 
+  public playSiren(durationSeconds = 4.0): boolean {
+    return this.playHunterSiren(durationSeconds);
+  }
+
   /**
    * Proximity Heartbeat ("lub-dub" low-frequency pulse) for Hiders when a Hunter
    * is within 40m (<20m = CRITICAL fast pulse, 20m-40m = NEAR steady pulse).
@@ -153,15 +291,19 @@ class ManhuntSoundEngine {
     try {
       const ctx = this.getOrCreateContext();
       if (!ctx) return false;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const dest = this.getDestination(ctx);
 
       const now = ctx.currentTime;
-      const peakGain = intensity === 'CRITICAL' ? 0.42 : 0.24;
+      const peakGain = intensity === 'CRITICAL' ? 0.65 : 0.42;
       const baseFreq = intensity === 'CRITICAL' ? 95 : 75;
 
       // Two-beat "lub-dub" pulse
       const beats = [
         { offset: 0, dur: 0.11, freqStart: baseFreq + 25, freqEnd: baseFreq - 15, amp: peakGain },
-        { offset: 0.15, dur: 0.13, freqStart: baseFreq + 15, freqEnd: baseFreq - 20, amp: peakGain * 0.8 },
+        { offset: 0.15, dur: 0.13, freqStart: baseFreq + 15, freqEnd: baseFreq - 20, amp: peakGain * 0.85 },
       ];
 
       beats.forEach(({ offset, dur, freqStart, freqEnd, amp }) => {
@@ -178,7 +320,7 @@ class ManhuntSoundEngine {
         gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
 
         osc.connect(gain);
-        gain.connect(ctx.destination);
+        gain.connect(dest);
         osc.start(start);
         osc.stop(start + dur);
       });
@@ -192,6 +334,10 @@ class ManhuntSoundEngine {
     }
   }
 
+  public playHeartbeat(intensity: 'NEAR' | 'CRITICAL' = 'NEAR'): boolean {
+    return this.playHeartbeatPulse(intensity);
+  }
+
   /**
    * Ghost Cloak Activation Tone: Stealthy sci-fi shimmer sound when Hider cloaks for 60s.
    */
@@ -199,6 +345,10 @@ class ManhuntSoundEngine {
     try {
       const ctx = this.getOrCreateContext();
       if (!ctx) return false;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const dest = this.getDestination(ctx);
 
       const now = ctx.currentTime;
       const notes = [587.33, 440, 329.63, 293.66];
@@ -212,11 +362,11 @@ class ManhuntSoundEngine {
         osc.frequency.setValueAtTime(freq, start);
 
         gain.gain.setValueAtTime(0.001, start);
-        gain.gain.linearRampToValueAtTime(0.32, start + 0.02);
+        gain.gain.linearRampToValueAtTime(0.5, start + 0.02);
         gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
 
         osc.connect(gain);
-        gain.connect(ctx.destination);
+        gain.connect(dest);
         osc.start(start);
         osc.stop(start + dur);
       });
@@ -235,6 +385,10 @@ class ManhuntSoundEngine {
     try {
       const ctx = this.getOrCreateContext();
       if (!ctx) return false;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const dest = this.getDestination(ctx);
 
       const now = ctx.currentTime;
       const pattern = [
@@ -253,11 +407,11 @@ class ManhuntSoundEngine {
         osc.frequency.setValueAtTime(freq, start);
 
         gain.gain.setValueAtTime(0.001, start);
-        gain.gain.linearRampToValueAtTime(0.5, start + 0.02);
+        gain.gain.linearRampToValueAtTime(0.7, start + 0.02);
         gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
 
         osc.connect(gain);
-        gain.connect(ctx.destination);
+        gain.connect(dest);
         osc.start(start);
         osc.stop(start + dur);
       });
@@ -276,23 +430,28 @@ class ManhuntSoundEngine {
     try {
       const ctx = this.getOrCreateContext();
       if (!ctx) return false;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const dest = this.getDestination(ctx);
 
       const now = ctx.currentTime;
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       const isFinalSecond = secondsLeft <= 1;
-      const freq = isFinalSecond ? 1046.5 : 740;
-      const dur = isFinalSecond ? 0.28 : 0.11;
+      const isLastFive = secondsLeft <= 5;
+      const freq = isFinalSecond ? 1046.5 : isLastFive ? 880 : 740;
+      const dur = isFinalSecond ? 0.28 : 0.13;
 
-      osc.type = 'sine';
+      osc.type = 'triangle';
       osc.frequency.setValueAtTime(freq, now);
 
       gain.gain.setValueAtTime(0.001, now);
-      gain.gain.linearRampToValueAtTime(0.35, now + 0.015);
+      gain.gain.linearRampToValueAtTime(isLastFive ? 0.65 : 0.5, now + 0.015);
       gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
 
       osc.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(dest);
       osc.start(now);
       osc.stop(now + dur);
       return true;
@@ -308,6 +467,10 @@ class ManhuntSoundEngine {
     try {
       const ctx = this.getOrCreateContext();
       if (!ctx) return false;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const dest = this.getDestination(ctx);
 
       const now = ctx.currentTime;
       const notes =
@@ -325,11 +488,11 @@ class ManhuntSoundEngine {
         osc.frequency.setValueAtTime(freq, start);
 
         gain.gain.setValueAtTime(0.001, start);
-        gain.gain.linearRampToValueAtTime(0.45, start + 0.02);
+        gain.gain.linearRampToValueAtTime(0.65, start + 0.02);
         gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
 
         osc.connect(gain);
-        gain.connect(ctx.destination);
+        gain.connect(dest);
         osc.start(start);
         osc.stop(start + dur);
       });
@@ -348,6 +511,10 @@ class ManhuntSoundEngine {
     try {
       const ctx = this.getOrCreateContext();
       if (!ctx) return false;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const dest = this.getDestination(ctx);
 
       const now = ctx.currentTime;
       if (winnerTeam === 'NONE') {
@@ -366,9 +533,9 @@ class ManhuntSoundEngine {
         const start = now + offset;
         const gain = ctx.createGain();
         gain.gain.setValueAtTime(0.001, start);
-        gain.gain.linearRampToValueAtTime(0.42, start + 0.025);
+        gain.gain.linearRampToValueAtTime(0.6, start + 0.025);
         gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
-        gain.connect(ctx.destination);
+        gain.connect(dest);
 
         freqs.forEach((f, idx) => {
           const osc = ctx.createOscillator();
@@ -395,6 +562,10 @@ class ManhuntSoundEngine {
     try {
       const ctx = this.getOrCreateContext();
       if (!ctx) return false;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const dest = this.getDestination(ctx);
 
       const now = ctx.currentTime;
       const noiseDur = 0.14;
@@ -416,12 +587,12 @@ class ManhuntSoundEngine {
 
       const noiseGain = ctx.createGain();
       noiseGain.gain.setValueAtTime(0.01, now);
-      noiseGain.gain.linearRampToValueAtTime(0.35, now + 0.02);
+      noiseGain.gain.linearRampToValueAtTime(0.5, now + 0.02);
       noiseGain.gain.exponentialRampToValueAtTime(0.001, now + noiseDur);
 
       noiseSource.connect(filter);
       filter.connect(noiseGain);
-      noiseGain.connect(ctx.destination);
+      noiseGain.connect(dest);
       noiseSource.start(now);
       noiseSource.stop(now + noiseDur);
 
@@ -437,11 +608,11 @@ class ManhuntSoundEngine {
         osc.frequency.setValueAtTime(freq, start);
 
         gain.gain.setValueAtTime(0.001, start);
-        gain.gain.linearRampToValueAtTime(0.28, start + 0.008);
+        gain.gain.linearRampToValueAtTime(0.42, start + 0.008);
         gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
 
         osc.connect(gain);
-        gain.connect(ctx.destination);
+        gain.connect(dest);
         osc.start(start);
         osc.stop(start + dur);
       });
@@ -470,10 +641,11 @@ class ManhuntSoundEngine {
     };
 
     try {
-      const ctx = this.getOrCreateContext();
+      const ctx = await this.ensureContextRunning();
+      const dest = ctx ? this.getDestination(ctx) : null;
       if (!audioDataUrl || audioDataUrl === 'SYNTH_VOICE' || !audioDataUrl.startsWith('data:audio')) {
         // Fallback synthesized walkie-talkie voice cadence when mic isn't available
-        if (ctx) {
+        if (ctx && dest) {
           const now = ctx.currentTime + 0.16;
           const syllables = disguised
             ? [190, 215, 175, 230, 165, 205]
@@ -494,12 +666,12 @@ class ManhuntSoundEngine {
             filter.Q.setValueAtTime(1.2, start);
 
             gain.gain.setValueAtTime(0.001, start);
-            gain.gain.linearRampToValueAtTime(0.32, start + 0.02);
+            gain.gain.linearRampToValueAtTime(0.5, start + 0.02);
             gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
 
             osc.connect(filter);
             filter.connect(gain);
-            gain.connect(ctx.destination);
+            gain.connect(dest);
             osc.start(start);
             osc.stop(start + dur);
           });
@@ -518,7 +690,7 @@ class ManhuntSoundEngine {
         bytes[i] = binaryString.charCodeAt(i);
       }
 
-      if (ctx) {
+      if (ctx && dest) {
         try {
           const decodedBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0));
           const source = ctx.createBufferSource();
@@ -531,11 +703,11 @@ class ManhuntSoundEngine {
           radioFilter.Q.setValueAtTime(0.85, ctx.currentTime);
 
           const boostGain = ctx.createGain();
-          boostGain.gain.setValueAtTime(1.35, ctx.currentTime);
+          boostGain.gain.setValueAtTime(1.6, ctx.currentTime);
 
           source.connect(radioFilter);
           radioFilter.connect(boostGain);
-          boostGain.connect(ctx.destination);
+          boostGain.connect(dest);
 
           source.onended = () => {
             finishPlayback();
@@ -548,6 +720,7 @@ class ManhuntSoundEngine {
       }
 
       const audioEl = new Audio(audioDataUrl);
+      audioEl.volume = 1.0;
       const anyAudio = audioEl as HTMLAudioElement & {
         preservesPitch?: boolean;
         mozPreservesPitch?: boolean;
@@ -579,6 +752,10 @@ class ManhuntSoundEngine {
     try {
       const ctx = this.getOrCreateContext();
       if (!ctx) return false;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const dest = this.getDestination(ctx);
 
       const now = ctx.currentTime;
 
@@ -598,10 +775,10 @@ class ManhuntSoundEngine {
           osc.type = 'square';
           osc.frequency.setValueAtTime(freq, start);
           gain.gain.setValueAtTime(0.001, start);
-          gain.gain.linearRampToValueAtTime(0.38, start + 0.02);
+          gain.gain.linearRampToValueAtTime(0.58, start + 0.02);
           gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
           osc.connect(gain);
-          gain.connect(ctx.destination);
+          gain.connect(dest);
           osc.start(start);
           osc.stop(start + dur);
         });
@@ -622,11 +799,11 @@ class ManhuntSoundEngine {
           osc1.frequency.setValueAtTime(f1, start);
           osc2.frequency.setValueAtTime(f2, start);
           gain.gain.setValueAtTime(0.001, start);
-          gain.gain.linearRampToValueAtTime(0.45, start + 0.025);
+          gain.gain.linearRampToValueAtTime(0.65, start + 0.025);
           gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
           osc1.connect(gain);
           osc2.connect(gain);
-          gain.connect(ctx.destination);
+          gain.connect(dest);
           osc1.start(start);
           osc2.start(start);
           osc1.stop(start + dur);
@@ -645,10 +822,10 @@ class ManhuntSoundEngine {
           const start = now + offset;
           const gain = ctx.createGain();
           gain.gain.setValueAtTime(0.001, start);
-          gain.gain.linearRampToValueAtTime(0.55, start + 0.015);
-          gain.gain.setValueAtTime(0.5, Math.max(start + 0.02, start + dur - 0.06));
+          gain.gain.linearRampToValueAtTime(0.75, start + 0.015);
+          gain.gain.setValueAtTime(0.7, Math.max(start + 0.02, start + dur - 0.06));
           gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
-          gain.connect(ctx.destination);
+          gain.connect(dest);
 
           chordFreqs.forEach((freq) => {
             const osc = ctx.createOscillator();
@@ -671,11 +848,11 @@ class ManhuntSoundEngine {
         osc.frequency.exponentialRampToValueAtTime(340, now + 0.58);
 
         gain.gain.setValueAtTime(0.001, now);
-        gain.gain.linearRampToValueAtTime(0.48, now + 0.03);
+        gain.gain.linearRampToValueAtTime(0.65, now + 0.03);
         gain.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
 
         osc.connect(gain);
-        gain.connect(ctx.destination);
+        gain.connect(dest);
         osc.start(now);
         osc.stop(now + 0.6);
         this.vibrate([70, 40, 180]);

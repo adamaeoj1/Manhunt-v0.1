@@ -110,6 +110,11 @@ export const GameActionSchema = z.discriminatedUnion('action', [
     participantId: z.string().min(1),
     tauntType: z.enum(['CATCH_ME', 'I_SEE_YOU', 'AIRHORN', 'TOO_SLOW']),
   }),
+  z.object({
+    action: z.literal('SEND_NOTE'),
+    participantId: z.string().min(1),
+    message: z.string().trim().min(1, 'Note message cannot be empty.').max(160, 'Note message cannot exceed 160 characters.'),
+  }),
   z.object({ action: z.literal('SEND_SOUND'), participantId: z.string().min(1), targetHiderId: z.string().min(1) }),
   z.object({ action: z.literal('REQUEST_PHOTO'), participantId: z.string().min(1), targetHiderId: z.string().min(1) }),
   z.object({

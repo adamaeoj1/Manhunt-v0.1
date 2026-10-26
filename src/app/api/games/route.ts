@@ -11,15 +11,39 @@ import {
   performGameAction,
   submitParticipantGps,
   getAuthorizedGameState,
+  getRoomPreview,
   normalizeRoomCode,
 } from '@/lib/game-engine';
 
 export const dynamic = 'force-dynamic';
 
+const NO_STORE_HEADERS = {
+  'Cache-Control': 'no-store, no-cache, must-revalidate',
+};
+
 export async function GET(req: NextRequest) {
   try {
     const rawCode = req.nextUrl.searchParams.get('code') || '';
     const cleanCode = normalizeRoomCode(rawCode);
+    const isPreview = req.nextUrl.searchParams.get('preview') === '1';
+
+    if (isPreview) {
+      if (cleanCode.length !== 6) {
+        return NextResponse.json(
+          { error: 'Valid 6-character room code is required.' },
+          { status: 400, headers: NO_STORE_HEADERS }
+        );
+      }
+      const preview = await getRoomPreview(cleanCode);
+      if (!preview) {
+        return NextResponse.json(
+          { error: `Room "${cleanCode}" was not found or has expired.` },
+          { status: 404, headers: NO_STORE_HEADERS }
+        );
+      }
+      return NextResponse.json({ preview }, { headers: NO_STORE_HEADERS });
+    }
+
     const viewerId = (req.nextUrl.searchParams.get('participantId') || '').trim();
     const sinceRaw = Number(req.nextUrl.searchParams.get('since') || '0');
     const includeMedia = req.nextUrl.searchParams.get('includeMedia') === '1';
@@ -27,7 +51,7 @@ export async function GET(req: NextRequest) {
     if (!cleanCode || !viewerId) {
       return NextResponse.json(
         { error: 'Both code and participantId query parameters are required.' },
-        { status: 400 }
+        { status: 400, headers: NO_STORE_HEADERS }
       );
     }
 
@@ -35,11 +59,11 @@ export async function GET(req: NextRequest) {
       sinceMs: Number.isFinite(sinceRaw) ? sinceRaw : 0,
       includeMedia,
     });
-    return NextResponse.json({ snapshot });
+    return NextResponse.json({ snapshot }, { headers: NO_STORE_HEADERS });
   } catch (err: any) {
     return NextResponse.json(
       { error: err?.message || 'Could not fetch game state.' },
-      { status: 404 }
+      { status: 404, headers: NO_STORE_HEADERS }
     );
   }
 }

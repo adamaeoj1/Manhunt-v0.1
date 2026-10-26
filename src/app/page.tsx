@@ -25,6 +25,45 @@ const TAUNT_OPTIONS: Array<{ type: TauntType; label: string; emoji: string }> = 
   { type: 'TOO_SLOW', label: 'Too Slow!', emoji: '👻' },
 ];
 
+const QUICK_NOTE_PRESETS: string[] = [
+  '📍 Moving toward Academic Quad & Library',
+  '👀 Hunter spotted near Student Center!',
+  '🏃 Changing hiding spot — stay alert!',
+  '⚠️ Watch the green campus boundary!',
+];
+
+interface GameEventItem {
+  id: string;
+  type:
+    | 'NOTE'
+    | 'TAUNT'
+    | 'SOUND_ALERT'
+    | 'PHOTO_REQUEST'
+    | 'PHOTO_SUBMITTED'
+    | 'CAPTURE'
+    | 'CLOAK'
+    | 'WALKIE'
+    | 'SYSTEM';
+  senderId: string | null;
+  senderName: string;
+  senderRole: 'HUNTER' | 'HIDER' | 'HIDDEN' | null;
+  message: string;
+  createdAt: number;
+}
+
+interface RoomPreviewInfo {
+  code: string;
+  title: string;
+  state: 'LOBBY' | 'COUNTDOWN' | 'ACTIVE' | 'PAUSED' | 'FINISHED';
+  hostNickname: string;
+  playerCount: number;
+  maxPlayers: number;
+  hunterCount: number;
+  durationMinutes: number;
+  countdownSeconds: number;
+  radiusMeters: number;
+}
+
 interface ParticipantView {
   id: string;
   nickname: string;
@@ -73,6 +112,10 @@ interface GameSnapshot {
   state: 'LOBBY' | 'COUNTDOWN' | 'ACTIVE' | 'PAUSED' | 'FINISHED';
   storageMode: 'SUPABASE' | 'LOCAL_MEMORY';
   serverTime?: number;
+  serverNowMs?: number;
+  headStartEndsAtMs?: number | null;
+  gameEndsAtMs?: number | null;
+  pausedRemainingMs?: number | null;
   hostId: string;
   viewerId: string;
   viewerRole: 'HUNTER' | 'HIDER' | null;
@@ -123,6 +166,7 @@ interface GameSnapshot {
     hiderNickname: string;
     capturedAt: number;
   }>;
+  events?: GameEventItem[];
   soundAbility: { remainingUses: number; maxUses: number; cooldownSecondsLeft: number } | null;
   recentTargetedAlert: { id: string; hunterId: string; targetHiderId: string; deliveryStatus: string; createdAt: number } | null;
   recentWalkieMessages?: Array<{
@@ -161,6 +205,273 @@ function formatClock(totalSeconds: number): string {
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
+function computeTargetRemainingSeconds(
+  targetEndMs: number | null | undefined,
+  serverTimeOffsetMs: number,
+  fallbackSeconds: number
+): number {
+  if (typeof targetEndMs === 'number' && targetEndMs > 0) {
+    return Math.max(0, Math.ceil((targetEndMs - (Date.now() + serverTimeOffsetMs)) / 1000));
+  }
+  return Math.max(0, Math.floor(fallbackSeconds));
+}
+
+/**
+ * Isolated 250ms Real-Time Countdown Header Ticker wrapped in React.memo.
+ * Prevents full-page re-renders on every second tick while guaranteeing
+ * 100% smooth second-by-second countdown (0:10 -> 0:09 -> 0:08...) and instant
+ * transition from COUNTDOWN to ACTIVE at 0:00.
+ */
+const SmoothCountdownHeaderTicker = React.memo(function SmoothCountdownHeaderTicker({
+  state,
+  headStartEndsAtMs,
+  gameEndsAtMs,
+  pausedRemainingMs,
+  fallbackCountdownSeconds,
+  fallbackGameSeconds,
+  serverTimeOffsetMs,
+  onCountdownZero,
+}: {
+  state: 'LOBBY' | 'COUNTDOWN' | 'ACTIVE' | 'PAUSED' | 'FINISHED';
+  headStartEndsAtMs?: number | null;
+  gameEndsAtMs?: number | null;
+  pausedRemainingMs?: number | null;
+  fallbackCountdownSeconds: number;
+  fallbackGameSeconds: number;
+  serverTimeOffsetMs: number;
+  onCountdownZero?: () => void;
+}) {
+  const [displaySecs, setDisplaySecs] = useState<number>(() => {
+    if (state === 'COUNTDOWN') {
+      return computeTargetRemainingSeconds(headStartEndsAtMs, serverTimeOffsetMs, fallbackCountdownSeconds);
+    }
+    if (state === 'PAUSED') {
+      return typeof pausedRemainingMs === 'number'
+        ? Math.max(0, Math.ceil(pausedRemainingMs / 1000))
+        : Math.max(0, Math.floor(fallbackGameSeconds));
+    }
+    return computeTargetRemainingSeconds(gameEndsAtMs, serverTimeOffsetMs, fallbackGameSeconds);
+  });
+
+  const lastBeepSecRef = useRef<number | null>(null);
+  const zeroTriggeredRef = useRef(false);
+
+  useEffect(() => {
+    zeroTriggeredRef.current = false;
+    lastBeepSecRef.current = null;
+  }, [state, headStartEndsAtMs]);
+
+  useEffect(() => {
+    const tick = () => {
+      if (state === 'COUNTDOWN') {
+        const secs = computeTargetRemainingSeconds(headStartEndsAtMs, serverTimeOffsetMs, fallbackCountdownSeconds);
+        setDisplaySecs((prev) => (prev !== secs ? secs : prev));
+        if (secs >= 1 && secs <= 10 && lastBeepSecRef.current !== secs) {
+          lastBeepSecRef.current = secs;
+          soundEngine.playCountdownTick(secs);
+        }
+        if (secs <= 0 && !zeroTriggeredRef.current) {
+          zeroTriggeredRef.current = true;
+          if (onCountdownZero) onCountdownZero();
+        }
+      } else if (state === 'PAUSED') {
+        const secs =
+          typeof pausedRemainingMs === 'number'
+            ? Math.max(0, Math.ceil(pausedRemainingMs / 1000))
+            : Math.max(0, Math.floor(fallbackGameSeconds));
+        setDisplaySecs((prev) => (prev !== secs ? secs : prev));
+      } else if (state === 'ACTIVE') {
+        const secs = computeTargetRemainingSeconds(gameEndsAtMs, serverTimeOffsetMs, fallbackGameSeconds);
+        setDisplaySecs((prev) => (prev !== secs ? secs : prev));
+      }
+    };
+
+    tick();
+    const timer = setInterval(tick, 250);
+    return () => clearInterval(timer);
+  }, [
+    state,
+    headStartEndsAtMs,
+    gameEndsAtMs,
+    pausedRemainingMs,
+    fallbackCountdownSeconds,
+    fallbackGameSeconds,
+    serverTimeOffsetMs,
+    onCountdownZero,
+  ]);
+
+  return (
+    <span className="font-mono font-bold text-xl text-ink leading-none">
+      {state === 'COUNTDOWN'
+        ? `Start in ${formatClock(displaySecs)}`
+        : state === 'PAUSED'
+        ? `${formatClock(displaySecs)} (PAUSED)`
+        : formatClock(displaySecs)}
+    </span>
+  );
+});
+
+/**
+ * Isolated 250ms Real-Time Countdown for Role Reveal Screen wrapped in React.memo.
+ */
+const RoleRevealCountdownCard = React.memo(function RoleRevealCountdownCard({
+  state,
+  isHunter,
+  headStartEndsAtMs,
+  gameEndsAtMs,
+  pausedRemainingMs,
+  fallbackCountdownSeconds,
+  fallbackGameSeconds,
+  serverTimeOffsetMs,
+  onCountdownZero,
+  onOpenMap,
+}: {
+  state: 'LOBBY' | 'COUNTDOWN' | 'ACTIVE' | 'PAUSED' | 'FINISHED';
+  isHunter: boolean;
+  headStartEndsAtMs?: number | null;
+  gameEndsAtMs?: number | null;
+  pausedRemainingMs?: number | null;
+  fallbackCountdownSeconds: number;
+  fallbackGameSeconds: number;
+  serverTimeOffsetMs: number;
+  onCountdownZero?: () => void;
+  onOpenMap: () => void;
+}) {
+  const [countdownSecs, setCountdownSecs] = useState<number>(() =>
+    computeTargetRemainingSeconds(headStartEndsAtMs, serverTimeOffsetMs, fallbackCountdownSeconds)
+  );
+  const [gameSecs, setGameSecs] = useState<number>(() =>
+    computeTargetRemainingSeconds(gameEndsAtMs, serverTimeOffsetMs, fallbackGameSeconds)
+  );
+  const lastBeepSecRef = useRef<number | null>(null);
+  const zeroTriggeredRef = useRef(false);
+
+  useEffect(() => {
+    zeroTriggeredRef.current = false;
+    lastBeepSecRef.current = null;
+  }, [state, headStartEndsAtMs]);
+
+  useEffect(() => {
+    const tick = () => {
+      if (state === 'COUNTDOWN') {
+        const secs = computeTargetRemainingSeconds(headStartEndsAtMs, serverTimeOffsetMs, fallbackCountdownSeconds);
+        setCountdownSecs((prev) => (prev !== secs ? secs : prev));
+        if (secs >= 1 && secs <= 10 && lastBeepSecRef.current !== secs) {
+          lastBeepSecRef.current = secs;
+          soundEngine.playCountdownTick(secs);
+        }
+        if (secs <= 0 && !zeroTriggeredRef.current) {
+          zeroTriggeredRef.current = true;
+          if (onCountdownZero) onCountdownZero();
+        }
+      } else if (state === 'PAUSED') {
+        const secs =
+          typeof pausedRemainingMs === 'number'
+            ? Math.max(0, Math.ceil(pausedRemainingMs / 1000))
+            : Math.max(0, Math.floor(fallbackGameSeconds));
+        setGameSecs((prev) => (prev !== secs ? secs : prev));
+      } else {
+        const secs = computeTargetRemainingSeconds(gameEndsAtMs, serverTimeOffsetMs, fallbackGameSeconds);
+        setGameSecs((prev) => (prev !== secs ? secs : prev));
+      }
+    };
+
+    tick();
+    const timer = setInterval(tick, 250);
+    return () => clearInterval(timer);
+  }, [
+    state,
+    headStartEndsAtMs,
+    gameEndsAtMs,
+    pausedRemainingMs,
+    fallbackCountdownSeconds,
+    fallbackGameSeconds,
+    serverTimeOffsetMs,
+    onCountdownZero,
+  ]);
+
+  const isCountingDown = state === 'COUNTDOWN' && countdownSecs > 0;
+  const isHunterLocked = Boolean(isHunter && isCountingDown);
+
+  return (
+    <>
+      <div className="p-4 rounded-2xl bg-canvas border border-stoneline">
+        <span className="text-xs font-semibold text-ink-muted block">
+          {isCountingDown ? 'Hider head-start countdown' : 'Time remaining'}
+        </span>
+        <span className="font-mono font-bold text-3xl text-ink mt-1 block">
+          {isCountingDown ? formatClock(countdownSecs) : formatClock(gameSecs)}
+        </span>
+        {isHunterLocked && (
+          <span className="text-xs font-semibold text-amber-800 mt-1.5 block">
+            Live map &amp; Hider locations are locked while Hiders hide!
+          </span>
+        )}
+      </div>
+      <button
+        type="button"
+        disabled={isHunterLocked}
+        onClick={onOpenMap}
+        className="btn-cedar w-full h-14 rounded-2xl font-display font-bold text-base shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
+      >
+        {isHunterLocked
+          ? `Map Locked During Countdown (${formatClock(countdownSecs)})`
+          : 'Open Live Campus Map'}
+      </button>
+    </>
+  );
+});
+
+/**
+ * Isolated 250ms Real-Time Countdown Overlay when Hunter map is locked during COUNTDOWN.
+ */
+const HunterLockedMapCountdownOverlay = React.memo(function HunterLockedMapCountdownOverlay({
+  headStartEndsAtMs,
+  fallbackCountdownSeconds,
+  serverTimeOffsetMs,
+  onCountdownZero,
+}: {
+  headStartEndsAtMs?: number | null;
+  fallbackCountdownSeconds: number;
+  serverTimeOffsetMs: number;
+  onCountdownZero?: () => void;
+}) {
+  const [secsLeft, setSecsLeft] = useState<number>(() =>
+    computeTargetRemainingSeconds(headStartEndsAtMs, serverTimeOffsetMs, fallbackCountdownSeconds)
+  );
+  const zeroTriggeredRef = useRef(false);
+
+  useEffect(() => {
+    zeroTriggeredRef.current = false;
+  }, [headStartEndsAtMs]);
+
+  useEffect(() => {
+    const tick = () => {
+      const secs = computeTargetRemainingSeconds(headStartEndsAtMs, serverTimeOffsetMs, fallbackCountdownSeconds);
+      setSecsLeft((prev) => (prev !== secs ? secs : prev));
+      if (secs <= 0 && !zeroTriggeredRef.current) {
+        zeroTriggeredRef.current = true;
+        if (onCountdownZero) onCountdownZero();
+      }
+    };
+    tick();
+    const timer = setInterval(tick, 250);
+    return () => clearInterval(timer);
+  }, [headStartEndsAtMs, fallbackCountdownSeconds, serverTimeOffsetMs, onCountdownZero]);
+
+  return (
+    <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center bg-stone-900/90 text-white">
+      <div className="w-16 h-16 rounded-2xl bg-hunter flex items-center justify-center font-mono font-extrabold text-2xl mb-3 shadow-lg">
+        {formatClock(secsLeft)}
+      </div>
+      <h3 className="font-display font-bold text-xl">Hiding Phase in Progress</h3>
+      <p className="text-xs text-stone-300 max-w-sm mt-1.5 leading-relaxed">
+        The live campus map and Hider positions are locked for Hunters during the head-start countdown. The map and capture controls will unlock automatically when the timer reaches 00:00.
+      </p>
+    </div>
+  );
+});
+
 export default function AuiManhuntPage() {
   return (
     <ManhuntErrorBoundary>
@@ -170,7 +481,18 @@ export default function AuiManhuntPage() {
 }
 
 function AuiManhuntApp() {
-  const [screen, setScreen] = useState<'HOME' | 'CREATE' | 'JOIN'>('HOME');
+  const [screen, setScreen] = useState<'HOME' | 'CREATE' | 'JOIN'>(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const rawRoom = (params.get('room') || params.get('code') || '')
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, '')
+        .slice(0, 6);
+      if (rawRoom.length === 6) return 'JOIN';
+    }
+    return 'HOME';
+  });
   const [roomCode, setRoomCode] = useState<string | null>(null);
   const [activePlayerId, setActivePlayerId] = useState<string | null>(null);
   const [knownPlayerIds, setKnownPlayerIds] = useState<string[]>([]);
@@ -204,8 +526,34 @@ function AuiManhuntApp() {
   });
   const [setupCenterCmd, setSetupCenterCmd] = useState<{ lat: number; lng: number; zoom?: number; ts: number } | null>(null);
 
-  const [joinCodeInput, setJoinCodeInput] = useState('');
+  const [joinCodeInput, setJoinCodeInput] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      return (params.get('room') || params.get('code') || '')
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, '')
+        .slice(0, 6);
+    }
+    return '';
+  });
   const [joinNicknameInput, setJoinNicknameInput] = useState('');
+  const joinNicknameInputRef = useRef<HTMLInputElement | null>(null);
+  const [roomPreview, setRoomPreview] = useState<RoomPreviewInfo | null>(null);
+  const [roomPreviewLoading, setRoomPreviewLoading] = useState(false);
+
+  // Live Notes & Activity Feed state
+  const [noteInput, setNoteInput] = useState('');
+  const [activeEventBanner, setActiveEventBanner] = useState<GameEventItem | null>(null);
+  const bannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const seenEventIdsRef = useRef<Set<string>>(new Set());
+  const seededEventsGameIdRef = useRef<string | null>(null);
+
+  // Server time offset & Request versioning / AbortController
+  const [serverTimeOffsetMs, setServerTimeOffsetMs] = useState(0);
+  const serverTimeOffsetRef = useRef(0);
+  const stateVersionRef = useRef(0);
+  const pollAbortControllerRef = useRef<AbortController | null>(null);
 
   // Form submission & optimistic action states
   const [isCreatingLobby, setIsCreatingLobby] = useState(false);
@@ -380,7 +728,48 @@ function AuiManhuntApp() {
     });
   }, []);
 
-  // Isolate player session in per-tab sessionStorage and auto-read room code from URL
+  const triggerEventBanner = useCallback((evt: GameEventItem) => {
+    if (bannerTimerRef.current) {
+      clearTimeout(bannerTimerRef.current);
+      bannerTimerRef.current = null;
+    }
+    setActiveEventBanner(evt);
+    bannerTimerRef.current = setTimeout(() => {
+      setActiveEventBanner((curr) => (curr?.id === evt.id ? null : curr));
+      bannerTimerRef.current = null;
+    }, 6000);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (bannerTimerRef.current) {
+        clearTimeout(bannerTimerRef.current);
+      }
+      if (pollAbortControllerRef.current) {
+        pollAbortControllerRef.current.abort();
+      }
+    };
+  }, []);
+
+  // Global first-interaction AudioContext auto-unlock & state sync
+  useEffect(() => {
+    soundEngine.registerGlobalAutoUnlock();
+    const onFirstUserGesture = () => {
+      setSoundUnlockedLocal(true);
+    };
+    window.addEventListener('pointerdown', onFirstUserGesture, { once: true, capture: true, passive: true });
+    window.addEventListener('touchstart', onFirstUserGesture, { once: true, capture: true, passive: true });
+    window.addEventListener('click', onFirstUserGesture, { once: true, capture: true, passive: true });
+    window.addEventListener('keydown', onFirstUserGesture, { once: true, capture: true, passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', onFirstUserGesture, true);
+      window.removeEventListener('touchstart', onFirstUserGesture, true);
+      window.removeEventListener('click', onFirstUserGesture, true);
+      window.removeEventListener('keydown', onFirstUserGesture, true);
+    };
+  }, []);
+
+  // Isolate player session in per-tab sessionStorage and auto-read room code from URL (?room=CODE)
   useEffect(() => {
     try {
       window.localStorage.removeItem('aui_manhunt_session');
@@ -390,7 +779,11 @@ function AuiManhuntApp() {
     } catch {}
 
     const params = new URLSearchParams(window.location.search);
-    const rawRoomParam = (params.get('room') || params.get('code') || '').trim().toUpperCase().slice(0, 6);
+    const rawRoomParam = (params.get('room') || params.get('code') || '')
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, '')
+      .slice(0, 6);
 
     let restoredRoom: string | null = null;
     let restoredPlayerId: string | null = null;
@@ -402,7 +795,7 @@ function AuiManhuntApp() {
       if (rawSession) {
         const parsed = JSON.parse(rawSession);
         if (parsed && typeof parsed.roomCode === 'string' && typeof parsed.activePlayerId === 'string') {
-          restoredRoom = parsed.roomCode;
+          restoredRoom = parsed.roomCode.trim().toUpperCase();
           restoredPlayerId = parsed.activePlayerId;
           restoredKnownIds = Array.isArray(parsed.knownPlayerIds) ? parsed.knownPlayerIds : [parsed.activePlayerId];
           restoredDismissed =
@@ -428,10 +821,51 @@ function AuiManhuntApp() {
       setActivePlayerId(restoredPlayerId);
       setKnownPlayerIds(restoredKnownIds);
       setDismissedRoleForPlayers(restoredDismissed);
+    } else if (rawRoomParam) {
+      setScreen('JOIN');
     }
 
     setSessionHydrated(true);
   }, []);
+
+  // Automatically fetch room preview & focus nickname field when on JOIN screen with 6-character code
+  useEffect(() => {
+    if (snapshot || screen !== 'JOIN') return;
+    const cleanCode = joinCodeInput.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (cleanCode.length === 6) {
+      setTimeout(() => {
+        joinNicknameInputRef.current?.focus();
+      }, 60);
+
+      let cancelled = false;
+      setRoomPreviewLoading(true);
+      fetch(`/api/games?code=${encodeURIComponent(cleanCode)}&preview=1`, { cache: 'no-store' })
+        .then(async (res) => {
+          if (cancelled) return;
+          if (!res.ok) {
+            setRoomPreview(null);
+            return;
+          }
+          const data = await res.json();
+          if (!cancelled && data.preview) {
+            setRoomPreview(data.preview);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setRoomPreview(null);
+        })
+        .finally(() => {
+          if (!cancelled) setRoomPreviewLoading(false);
+        });
+
+      return () => {
+        cancelled = true;
+      };
+    } else {
+      setRoomPreview(null);
+      setRoomPreviewLoading(false);
+    }
+  }, [snapshot, screen, joinCodeInput]);
 
   useEffect(() => {
     if (!sessionHydrated) return;
@@ -585,8 +1019,14 @@ function AuiManhuntApp() {
   }, []);
 
   const hydrateSnapshotWithMediaCache = useCallback((rawSnap: GameSnapshot, pid: string): GameSnapshot => {
-    if (rawSnap.serverTime && rawSnap.serverTime > lastServerTimeRef.current) {
-      lastServerTimeRef.current = rawSnap.serverTime;
+    const serverNow = rawSnap.serverNowMs || rawSnap.serverTime;
+    if (typeof serverNow === 'number' && serverNow > 0) {
+      const offset = serverNow - Date.now();
+      serverTimeOffsetRef.current = offset;
+      setServerTimeOffsetMs((prev) => (Math.abs(prev - offset) > 200 ? offset : prev));
+      if (serverNow > lastServerTimeRef.current) {
+        lastServerTimeRef.current = serverNow;
+      }
     }
     const inClearGrace = Date.now() < gpsClearGraceUntilRef.current;
     return {
@@ -620,14 +1060,19 @@ function AuiManhuntApp() {
       if (pollInFlightRef.current || (actionInFlightCountRef.current > 0 && !includeMedia)) return;
       const cleanCode = code.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
       if (!cleanCode || !pid) return;
+
+      const reqVersion = stateVersionRef.current;
+      const controller = new AbortController();
+      pollAbortControllerRef.current = controller;
       pollInFlightRef.current = true;
+
       try {
         const sinceParam = includeMedia ? 0 : lastServerTimeRef.current;
         const res = await fetch(
           `/api/games?code=${encodeURIComponent(cleanCode)}&participantId=${encodeURIComponent(pid)}&since=${sinceParam}${
             includeMedia ? '&includeMedia=1' : ''
           }`,
-          { cache: 'no-store' }
+          { cache: 'no-store', signal: controller.signal }
         );
         if (!res.ok) {
           if (res.status === 404) {
@@ -635,11 +1080,28 @@ function AuiManhuntApp() {
             setActivePlayerId(null);
             setSnapshot(null);
             setKnownPlayerIds([]);
+            if (cleanCode.length === 6) {
+              setJoinCodeInput(cleanCode);
+              setScreen('JOIN');
+            }
           }
           return;
         }
-        if (actionInFlightCountRef.current > 0 && !includeMedia) return;
+        if (
+          controller.signal.aborted ||
+          reqVersion !== stateVersionRef.current ||
+          (actionInFlightCountRef.current > 0 && !includeMedia)
+        ) {
+          return;
+        }
         const data = await res.json();
+        if (
+          controller.signal.aborted ||
+          reqVersion !== stateVersionRef.current ||
+          (actionInFlightCountRef.current > 0 && !includeMedia)
+        ) {
+          return;
+        }
         if (data.snapshot) {
           const inClearGrace = Date.now() < gpsClearGraceUntilRef.current;
           const nextSnap = hydrateSnapshotWithMediaCache(data.snapshot, pid);
@@ -652,11 +1114,30 @@ function AuiManhuntApp() {
         }
       } catch {
       } finally {
+        if (pollAbortControllerRef.current === controller) {
+          pollAbortControllerRef.current = null;
+        }
         pollInFlightRef.current = false;
       }
     },
     [hydrateSnapshotWithMediaCache, stopAllGpsTracking]
   );
+
+  // Instant transition when local 250ms countdown ticker hits 0:00
+  const handleCountdownReachedZero = useCallback(() => {
+    setSnapshot((prev) => {
+      if (!prev || prev.state !== 'COUNTDOWN') return prev;
+      return {
+        ...prev,
+        state: 'ACTIVE',
+        countdownSecondsLeft: 0,
+      };
+    });
+    const { roomCode: code, activePlayerId: pid } = latestStateRef.current;
+    if (code && pid) {
+      fetchGameState(code, pid);
+    }
+  }, [fetchGameState]);
 
   // Lightweight delta-synced polling loop (2000ms) with clean teardown
   useEffect(() => {
@@ -670,7 +1151,7 @@ function AuiManhuntApp() {
     return () => clearInterval(timer);
   }, [roomCode, activePlayerId, fetchGameState]);
 
-  // Real-time sound triggers: Hunter 4s Siren, Photo Request Chime, Countdown last 10s, Start/Finish fanfare
+  // Real-time sound & live notes/events triggers
   useEffect(() => {
     if (!snapshot) {
       prevGameStateRef.current = null;
@@ -690,33 +1171,26 @@ function AuiManhuntApp() {
     }
     prevGameStateRef.current = snapshot.state;
 
-    // 2. Final 10 seconds of Hiding Countdown
-    if (snapshot.state === 'COUNTDOWN') {
-      const secs = snapshot.countdownSecondsLeft;
-      if (secs >= 1 && secs <= 10 && lastCountdownTickRef.current !== secs) {
-        lastCountdownTickRef.current = secs;
-        soundEngine.playCountdownTick(secs);
-      }
-    } else {
-      lastCountdownTickRef.current = null;
-    }
+    let playedSpecificAlertThisCycle = false;
 
-    // 3. Targeted Hunter Sound Alert -> 4-second 600Hz/1200Hz Siren + Vibration
+    // 2. Targeted Hunter Sound Alert -> 4-second 600Hz/1200Hz Siren + Vibration
     if (snapshot.recentTargetedAlert) {
       const alert = snapshot.recentTargetedAlert;
       if (alert.targetHiderId === activePlayerId && !playedAlertIdsRef.current.has(alert.id)) {
         playedAlertIdsRef.current.add(alert.id);
+        playedSpecificAlertThisCycle = true;
         soundEngine.playHunterSiren(4.0);
         showToast('🚨 HUNTER SIREN ALERT! Your phone is broadcasting a 4-second siren!', 'warning');
       }
     }
 
-    // 4. Photo Request Alert for Hider & Photo Submission Notification for Hunter
+    // 3. Photo Request Alert for Hider & Photo Submission Notification for Hunter
     const currentMe = snapshot.participants.find((p) => p.id === activePlayerId);
     if (currentMe?.photoRequest && currentMe.photoRequest.status === 'PENDING') {
       const prId = currentMe.photoRequest.id;
       if (!notifiedPhotoReqIdsRef.current.has(prId)) {
         notifiedPhotoReqIdsRef.current.add(prId);
+        playedSpecificAlertThisCycle = true;
         soundEngine.playPhotoRequestAlert();
         showToast('📷 A Hunter requested a photo of your surroundings! Respond before the timer expires.', 'warning');
       }
@@ -728,6 +1202,7 @@ function AuiManhuntApp() {
         if (pr && pr.status === 'SUBMITTED' && pr.hasPhoto && pr.photoDataUrl) {
           if (!notifiedSubmittedPhotoIdsRef.current.has(pr.id)) {
             notifiedSubmittedPhotoIdsRef.current.add(pr.id);
+            playedSpecificAlertThisCycle = true;
             soundEngine.playPhotoRequestAlert();
             showToast(`📷 ${p.nickname} submitted a surroundings photo! Opening intel view...`, 'info');
             setViewerPhotoModal({ nickname: p.nickname, url: pr.photoDataUrl });
@@ -736,11 +1211,12 @@ function AuiManhuntApp() {
       }
     }
 
-    // 5. Walkie-Talkie Incoming Voice Messages
+    // 4. Walkie-Talkie Incoming Voice Messages
     if (snapshot.recentWalkieMessages && snapshot.recentWalkieMessages.length > 0) {
       for (const msg of snapshot.recentWalkieMessages) {
         if (!playedWalkieIdsRef.current.has(msg.id)) {
           playedWalkieIdsRef.current.add(msg.id);
+          playedSpecificAlertThisCycle = true;
           const roleLabel = msg.senderRole || 'PLAYER';
           setActiveWalkieSpeaker({
             nickname: msg.senderNickname,
@@ -756,11 +1232,12 @@ function AuiManhuntApp() {
       }
     }
 
-    // 6. Quick Taunt Soundboard Broadcasts
+    // 5. Quick Taunt Soundboard Broadcasts
     if (snapshot.recentTaunts && snapshot.recentTaunts.length > 0) {
       for (const taunt of snapshot.recentTaunts) {
         if (!playedTauntIdsRef.current.has(taunt.id)) {
           playedTauntIdsRef.current.add(taunt.id);
+          playedSpecificAlertThisCycle = true;
           const meta = TAUNT_OPTIONS.find((t) => t.type === taunt.tauntType);
           const roleLabel = taunt.senderRole || 'Player';
           soundEngine.playTauntSound(taunt.tauntType);
@@ -771,7 +1248,36 @@ function AuiManhuntApp() {
         }
       }
     }
-  }, [snapshot, activePlayerId, showToast]);
+
+    // 6. Live Notes & Activity Feed Events (seenEventIdsRef + 6s Top Banner + Alert Chime)
+    if (snapshot.events && snapshot.events.length > 0) {
+      const approxServerNow = Date.now() + serverTimeOffsetRef.current;
+      if (seededEventsGameIdRef.current !== snapshot.id) {
+        seededEventsGameIdRef.current = snapshot.id;
+        for (const evt of snapshot.events) {
+          // Seed historical events older than 8s so we don't replay old history on refresh
+          if (approxServerNow - evt.createdAt > 8000 || evt.message.startsWith('🏁 Lobby')) {
+            seenEventIdsRef.current.add(evt.id);
+          }
+        }
+      }
+
+      let newestUnseenEvent: GameEventItem | null = null;
+      for (const evt of snapshot.events) {
+        if (!seenEventIdsRef.current.has(evt.id)) {
+          seenEventIdsRef.current.add(evt.id);
+          newestUnseenEvent = evt;
+        }
+      }
+
+      if (newestUnseenEvent) {
+        triggerEventBanner(newestUnseenEvent);
+        if (!playedSpecificAlertThisCycle && newestUnseenEvent.senderId !== activePlayerId) {
+          soundEngine.playNoteAlertChime();
+        }
+      }
+    }
+  }, [snapshot, activePlayerId, showToast, triggerEventBanner]);
 
   // Proximity Heartbeat Radar for Hiders when a Hunter is < 40m away
   useEffect(() => {
@@ -862,6 +1368,12 @@ function AuiManhuntApp() {
       if (!currentMe || currentMe.status !== 'ACTIVE') return;
 
       const boundedAccuracy = Math.max(1, Math.min(2400, Math.round(accuracy)));
+
+      stateVersionRef.current += 1;
+      if (pollAbortControllerRef.current) {
+        pollAbortControllerRef.current.abort();
+        pollAbortControllerRef.current = null;
+      }
 
       try {
         const res = await fetch('/api/games', {
@@ -1320,6 +1832,11 @@ function AuiManhuntApp() {
       return;
     }
     setIsCreatingLobby(true);
+    stateVersionRef.current += 1;
+    if (pollAbortControllerRef.current) {
+      pollAbortControllerRef.current.abort();
+      pollAbortControllerRef.current = null;
+    }
     try {
       const res = await fetch('/api/games', {
         method: 'POST',
@@ -1351,10 +1868,12 @@ function AuiManhuntApp() {
       clearGpsDeniedImmediately(false);
       lastServerTimeRef.current = data.snapshot?.serverTime || 0;
       photoCacheRef.current.clear();
+      seenEventIdsRef.current.clear();
+      seededEventsGameIdRef.current = null;
       setRoomCode(data.code);
       setActivePlayerId(data.participantId);
       setKnownPlayerIds([data.participantId]);
-      setSnapshot(data.snapshot);
+      setSnapshot(data.snapshot ? hydrateSnapshotWithMediaCache(data.snapshot, data.participantId) : null);
       setDismissedRoleForPlayers({});
       setLastGpsError(null);
       showToast(`Room ${data.code} created! Share the code or invite link with your friends.`);
@@ -1386,6 +1905,11 @@ function AuiManhuntApp() {
       return;
     }
     setIsJoiningLobby(true);
+    stateVersionRef.current += 1;
+    if (pollAbortControllerRef.current) {
+      pollAbortControllerRef.current.abort();
+      pollAbortControllerRef.current = null;
+    }
     try {
       const res = await fetch('/api/games', {
         method: 'POST',
@@ -1403,10 +1927,12 @@ function AuiManhuntApp() {
       setGpsPermissionDenied(false);
       lastServerTimeRef.current = data.snapshot?.serverTime || 0;
       photoCacheRef.current.clear();
+      seenEventIdsRef.current.clear();
+      seededEventsGameIdRef.current = null;
       setRoomCode(data.code);
       setActivePlayerId(data.participantId);
       setKnownPlayerIds([data.participantId]);
-      setSnapshot(data.snapshot);
+      setSnapshot(data.snapshot ? hydrateSnapshotWithMediaCache(data.snapshot, data.participantId) : null);
       setDismissedRoleForPlayers({});
       setLastGpsError(null);
       setJoinError(null);
@@ -1429,6 +1955,13 @@ function AuiManhuntApp() {
     const cleanCode = roomCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
     const actionType = String(payload.action || '');
     const key = actionKeyOverride || actionType;
+
+    // Increment request version & abort any in-flight GET poll so stale responses never overwrite newer state
+    stateVersionRef.current += 1;
+    if (pollAbortControllerRef.current) {
+      pollAbortControllerRef.current.abort();
+      pollAbortControllerRef.current = null;
+    }
 
     // 1. Capture previous snapshot for rollback and apply 0ms Optimistic UI update immediately
     const previousSnapshot = snapshot;
@@ -1508,6 +2041,24 @@ function AuiManhuntApp() {
         case 'SEND_TAUNT': {
           return { ...prev, tauntCooldownSecondsLeft: 15 };
         }
+        case 'SEND_NOTE': {
+          const senderMe = prev.participants.find((p) => p.id === activePlayerId);
+          const optimisticId = `opt-note-${Date.now()}`;
+          seenEventIdsRef.current.add(optimisticId);
+          const optimisticEvt: GameEventItem = {
+            id: optimisticId,
+            type: 'NOTE',
+            senderId: activePlayerId,
+            senderName: senderMe?.nickname || 'You',
+            senderRole: prev.viewerRole || senderMe?.role || null,
+            message: String(payload.message || ''),
+            createdAt: Date.now() + serverTimeOffsetRef.current,
+          };
+          return {
+            ...prev,
+            events: [...(prev.events || []).slice(-29), optimisticEvt],
+          };
+        }
         case 'SET_CONSENT': {
           const consent = Boolean(payload.consent);
           const denied = Boolean(payload.denied);
@@ -1556,6 +2107,9 @@ function AuiManhuntApp() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Action failed.');
+      if (data.eventId) {
+        seenEventIdsRef.current.add(String(data.eventId));
+      }
       if (data.snapshot) {
         setSnapshot(hydrateSnapshotWithMediaCache(data.snapshot, activePlayerId));
       }
@@ -1570,6 +2124,36 @@ function AuiManhuntApp() {
     } finally {
       actionInFlightCountRef.current = Math.max(0, actionInFlightCountRef.current - 1);
       setPendingActionKey((curr) => (curr === key ? null : curr));
+    }
+  }
+
+  async function handleSendNote(presetOrCustomText?: string) {
+    const rawText = (presetOrCustomText !== undefined ? presetOrCustomText : noteInput).trim();
+    if (!rawText) {
+      showToast('Please enter a note message first.', 'warning');
+      return;
+    }
+    if (presetOrCustomText === undefined) {
+      setNoteInput('');
+    }
+    setSoundUnlockedLocal(true);
+    soundEngine.playNoteAlertChime();
+    const res = await dispatchGameAction(
+      { action: 'SEND_NOTE', message: rawText },
+      `🔔 Live note broadcast to all players: "${rawText}"`,
+      'SEND_NOTE'
+    );
+    if (res?.eventId && snapshot) {
+      const mePart = snapshot.participants.find((p) => p.id === activePlayerId);
+      triggerEventBanner({
+        id: String(res.eventId),
+        type: 'NOTE',
+        senderId: activePlayerId,
+        senderName: mePart?.nickname || 'You',
+        senderRole: snapshot.viewerRole || mePart?.role || null,
+        message: rawText,
+        createdAt: Date.now(),
+      });
     }
   }
 
@@ -1798,6 +2382,9 @@ function AuiManhuntApp() {
     setLocalGpsFix(null);
     lastServerTimeRef.current = 0;
     photoCacheRef.current.clear();
+    seenEventIdsRef.current.clear();
+    seededEventsGameIdRef.current = null;
+    setActiveEventBanner(null);
     setPendingCaptureTarget(null);
     setShowCameraModal(false);
     setViewerPhotoModal(null);
@@ -2073,6 +2660,67 @@ function AuiManhuntApp() {
           </div>
         </div>
       </header>
+
+      {/* 6-Second Live Note & Game Event Top Animated Banner (z-index: 99998) */}
+      {activeEventBanner && (
+        <aside
+          aria-live="polite"
+          style={{ zIndex: 99998 }}
+          className="fixed top-16 left-1/2 -translate-x-1/2 w-[92%] max-w-lg shadow-2xl rounded-2xl p-3.5 sm:p-4 bg-stone-950 text-white border-2 border-cedar flex items-center justify-between gap-3 animate-fade-in"
+        >
+          <div className="flex items-center gap-3 min-w-0">
+            <span className="text-2xl shrink-0">
+              {activeEventBanner.type === 'NOTE'
+                ? '🔔'
+                : activeEventBanner.type === 'CAPTURE'
+                ? '🎯'
+                : activeEventBanner.type === 'PHOTO_REQUEST' || activeEventBanner.type === 'PHOTO_SUBMITTED'
+                ? '📷'
+                : activeEventBanner.type === 'SOUND_ALERT'
+                ? '🚨'
+                : activeEventBanner.type === 'TAUNT'
+                ? '📣'
+                : '⚡'}
+            </span>
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="font-display font-bold text-xs sm:text-sm text-white truncate">
+                  {activeEventBanner.senderName}
+                </span>
+                {activeEventBanner.senderRole && (
+                  <span
+                    className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                      activeEventBanner.senderRole === 'HUNTER'
+                        ? 'bg-hunter-light text-hunter'
+                        : 'bg-cedar-light text-cedar'
+                    }`}
+                  >
+                    {activeEventBanner.senderRole}
+                  </span>
+                )}
+                <span className="text-[10px] text-stone-400 font-mono">
+                  {new Date(activeEventBanner.createdAt).toLocaleTimeString([], {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                  })}
+                </span>
+              </div>
+              <p className="text-xs text-stone-200 font-medium leading-snug mt-0.5 break-words">
+                {activeEventBanner.message}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActiveEventBanner(null)}
+            aria-label="Dismiss event notification"
+            className="shrink-0 w-8 h-8 rounded-xl bg-white/10 hover:bg-white/20 text-white font-bold text-base flex items-center justify-center transition"
+          >
+            ×
+          </button>
+        </aside>
+      )}
 
       <main className="flex-1 flex flex-col max-w-3xl w-full mx-auto px-4 py-5">
         {!snapshot && screen === 'HOME' && (
@@ -2486,6 +3134,53 @@ function AuiManhuntApp() {
                 </button>
               </div>
 
+              {roomPreviewLoading && (
+                <div className="p-3 rounded-xl bg-canvas border border-stoneline text-xs text-ink-secondary flex items-center gap-2">
+                  <span className="inline-block w-3.5 h-3.5 border-2 border-cedar border-t-transparent rounded-full animate-spin" />
+                  <span>Checking room details for {joinCodeInput}...</span>
+                </div>
+              )}
+
+              {roomPreview && !roomPreviewLoading && (
+                <div className="p-3.5 rounded-2xl bg-cedar-subtle border border-cedar/30 text-xs space-y-2 shadow-sm">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-cedar block">
+                        Invite Room Found • Host: {roomPreview.hostNickname}
+                      </span>
+                      <strong className="font-display font-bold text-sm text-ink block">{roomPreview.title}</strong>
+                    </div>
+                    <span
+                      className={`px-2.5 py-1 rounded-full font-bold text-[11px] shrink-0 ${
+                        roomPreview.state === 'LOBBY'
+                          ? 'bg-emerald-100 text-emerald-800'
+                          : 'bg-amber-100 text-amber-900'
+                      }`}
+                    >
+                      {roomPreview.state === 'LOBBY' ? '🟢 Waiting in Lobby' : `⚡ ${roomPreview.state}`}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 pt-1.5 border-t border-cedar/15 text-[11px]">
+                    <div>
+                      <span className="text-ink-muted block">Players</span>
+                      <strong className="text-ink font-mono">
+                        {roomPreview.playerCount}/{roomPreview.maxPlayers}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-ink-muted block">Hunters &amp; Time</span>
+                      <strong className="text-ink">
+                        {roomPreview.hunterCount}H • {roomPreview.durationMinutes}m
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-ink-muted block">Campus Zone</span>
+                      <strong className="text-ink font-mono">{roomPreview.radiusMeters}m</strong>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <form onSubmit={handleJoinGame} className="space-y-4">
                 <div>
                   <label className="block text-xs font-semibold text-ink mb-1.5">6-Character Room Code *</label>
@@ -2510,10 +3205,12 @@ function AuiManhuntApp() {
                     <span className="text-[11px] text-ink-muted">3–15 chars (unique in room)</span>
                   </div>
                   <input
+                    ref={joinNicknameInputRef}
                     type="text"
                     required
                     minLength={3}
                     maxLength={15}
+                    autoFocus={joinCodeInput.trim().length === 6}
                     disabled={isJoiningLobby}
                     value={joinNicknameInput}
                     onChange={(e) => {
@@ -3018,6 +3715,97 @@ function AuiManhuntApp() {
                 </div>
               </div>
             </div>
+
+            {/* Live Notes & Activity Feed in Lobby */}
+            <div className="aui-card p-4 sm:p-5 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="font-display font-bold text-sm text-ink">
+                    📋 سجل الملاحظات والأحداث الحية (Live Notes &amp; Activity Feed)
+                  </h3>
+                  <p className="text-[11px] text-ink-muted">
+                    Send live notes &amp; sound alerts to everyone in the room
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-1.5">
+                {QUICK_NOTE_PRESETS.map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    disabled={pendingActionKey === 'SEND_NOTE'}
+                    onClick={() => handleSendNote(preset)}
+                    className="min-h-[36px] px-2.5 py-1 rounded-xl bg-canvas hover:bg-subtle border border-stoneline text-[11px] font-semibold text-ink transition disabled:opacity-50"
+                  >
+                    {preset}
+                  </button>
+                ))}
+              </div>
+
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  handleSendNote();
+                }}
+                className="flex items-center gap-2"
+              >
+                <input
+                  type="text"
+                  maxLength={140}
+                  value={noteInput}
+                  onChange={(e) => setNoteInput(e.target.value)}
+                  placeholder="Write a live note or alert to all players..."
+                  className="flex-1 h-11 px-3.5 rounded-xl bg-canvas border border-stoneline text-xs font-medium text-ink focus:outline-none focus:border-cedar"
+                />
+                <button
+                  type="submit"
+                  disabled={!noteInput.trim() || pendingActionKey === 'SEND_NOTE'}
+                  className="btn-cedar h-11 px-4 rounded-xl text-xs font-bold shrink-0 disabled:opacity-45"
+                >
+                  {pendingActionKey === 'SEND_NOTE' ? '⏳...' : '🔔 Send Note'}
+                </button>
+              </form>
+
+              {snapshot.events && snapshot.events.length > 0 && (
+                <div className="max-h-44 overflow-y-auto space-y-1.5 pr-1 pt-1 border-t border-stoneline">
+                  {[...snapshot.events]
+                    .slice()
+                    .reverse()
+                    .map((evt) => (
+                      <div
+                        key={evt.id}
+                        className="p-2.5 rounded-xl bg-canvas border border-stoneline text-xs flex items-start justify-between gap-2"
+                      >
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <strong className="font-bold text-ink">{evt.senderName}</strong>
+                            {evt.senderRole && (
+                              <span
+                                className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${
+                                  evt.senderRole === 'HUNTER'
+                                    ? 'bg-hunter-light text-hunter'
+                                    : 'bg-cedar-light text-cedar'
+                                }`}
+                              >
+                                {evt.senderRole}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-ink-secondary font-medium leading-snug">{evt.message}</p>
+                        </div>
+                        <span className="text-[10px] font-mono text-ink-muted shrink-0">
+                          {new Date(evt.createdAt).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit',
+                          })}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              )}
+            </div>
           </section>
         )}
 
@@ -3043,34 +3831,23 @@ function AuiManhuntApp() {
                       : 'Stay inside the permitted campus boundary and avoid capture until the timer reaches zero. Hunters are hidden from your screen.'}
                   </p>
                 </div>
-                <div className="p-4 rounded-2xl bg-canvas border border-stoneline">
-                  <span className="text-xs font-semibold text-ink-muted block">
-                    {snapshot.state === 'COUNTDOWN' ? 'Hider head-start countdown' : 'Time remaining'}
-                  </span>
-                  <span className="font-mono font-bold text-3xl text-ink mt-1 block">
-                    {snapshot.state === 'COUNTDOWN' ? formatClock(snapshot.countdownSecondsLeft) : formatClock(snapshot.gameSecondsLeft)}
-                  </span>
-                  {isHunterMapLocked && (
-                    <span className="text-xs font-semibold text-amber-800 mt-1.5 block">
-                      Live map &amp; Hider locations are locked while Hiders hide!
-                    </span>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  disabled={isHunterMapLocked}
-                  onClick={() => {
+                <RoleRevealCountdownCard
+                  state={snapshot.state}
+                  headStartEndsAtMs={snapshot.headStartEndsAtMs}
+                  gameEndsAtMs={snapshot.gameEndsAtMs}
+                  pausedRemainingMs={snapshot.pausedRemainingMs}
+                  fallbackCountdownSeconds={snapshot.countdownSecondsLeft}
+                  fallbackGameSeconds={snapshot.gameSecondsLeft}
+                  serverTimeOffsetMs={serverTimeOffsetMs}
+                  isHunter={isHunter}
+                  onCountdownZero={handleCountdownReachedZero}
+                  onOpenMap={() => {
                     soundEngine.unlockAndPlayActivationChime();
                     setSoundUnlockedLocal(true);
                     dispatchGameAction({ action: 'UNLOCK_AUDIO' });
                     setDismissedRoleForPlayers((prev) => ({ ...prev, [snapshot.viewerId]: true }));
                   }}
-                  className="btn-cedar w-full h-14 rounded-2xl font-display font-bold text-base shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {isHunterMapLocked
-                    ? `Map Locked During Countdown (${formatClock(snapshot.countdownSecondsLeft)})`
-                    : 'Open Live Campus Map'}
-                </button>
+                />
               </div>
             </section>
           )}
@@ -3258,16 +4035,16 @@ function AuiManhuntApp() {
                     <span className={`px-3 py-1.5 rounded-xl font-display font-bold text-xs text-white ${isHunter ? 'bg-hunter' : 'bg-cedar'}`}>
                       {isHunter ? 'HUNTER' : 'HIDER'}
                     </span>
-                    <div>
-                      <span className="text-[10px] uppercase tracking-wider text-ink-muted block font-semibold">Time left</span>
-                      <span className="font-mono font-bold text-xl text-ink leading-none">
-                        {snapshot.state === 'COUNTDOWN'
-                          ? `Start in ${snapshot.countdownSecondsLeft}s`
-                          : snapshot.state === 'PAUSED'
-                          ? `${formatClock(snapshot.gameSecondsLeft)} (PAUSED)`
-                          : formatClock(snapshot.gameSecondsLeft)}
-                      </span>
-                    </div>
+                    <SmoothCountdownHeaderTicker
+                      state={snapshot.state}
+                      headStartEndsAtMs={snapshot.headStartEndsAtMs}
+                      gameEndsAtMs={snapshot.gameEndsAtMs}
+                      pausedRemainingMs={snapshot.pausedRemainingMs}
+                      fallbackCountdownSeconds={snapshot.countdownSecondsLeft}
+                      fallbackGameSeconds={snapshot.gameSecondsLeft}
+                      serverTimeOffsetMs={serverTimeOffsetMs}
+                      onCountdownZero={handleCountdownReachedZero}
+                    />
                   </div>
 
                   <div className="flex items-center gap-2 flex-wrap">
@@ -3359,15 +4136,12 @@ function AuiManhuntApp() {
                 className="map-stack-container relative w-full h-[52dvh] min-h-[320px] max-h-[540px] rounded-2xl overflow-hidden border border-stoneline shadow-sm bg-[#EBF1EC]"
               >
                 {isHunterMapLocked ? (
-                  <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center bg-stone-900/90 text-white">
-                    <div className="w-14 h-14 rounded-2xl bg-hunter flex items-center justify-center font-display font-extrabold text-2xl mb-3 shadow-lg">
-                      {snapshot.countdownSecondsLeft}s
-                    </div>
-                    <h3 className="font-display font-bold text-xl">Hiding Phase in Progress</h3>
-                    <p className="text-xs text-stone-300 max-w-sm mt-1.5 leading-relaxed">
-                      The live campus map and Hider positions are locked for Hunters during the head-start countdown. The map and capture controls will unlock automatically when the timer reaches 00:00.
-                    </p>
-                  </div>
+                  <HunterLockedMapCountdownOverlay
+                    headStartEndsAtMs={snapshot.headStartEndsAtMs}
+                    fallbackCountdownSeconds={snapshot.countdownSecondsLeft}
+                    serverTimeOffsetMs={serverTimeOffsetMs}
+                    onCountdownZero={handleCountdownReachedZero}
+                  />
                 ) : (
                   <CampusMap
                     mode="gameplay"
@@ -3546,6 +4320,100 @@ function AuiManhuntApp() {
                         </button>
                       );
                     })}
+                  </div>
+                )}
+              </div>
+
+              {/* Live Notes & Activity Feed Below the Map */}
+              <div className="aui-card p-3.5 sm:p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-base">📋</span>
+                    <div>
+                      <h3 className="font-display font-bold text-xs sm:text-sm text-ink">
+                        سجل الملاحظات والأحداث الحية (Live Notes &amp; Activity Feed)
+                      </h3>
+                      <p className="text-[11px] text-ink-muted">
+                        Broadcast instant text notes &amp; sound alerts to all players’ screens (6s top banner + chime)
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-1.5">
+                  {QUICK_NOTE_PRESETS.map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      disabled={pendingActionKey === 'SEND_NOTE'}
+                      onClick={() => handleSendNote(preset)}
+                      className="min-h-[36px] px-2.5 py-1 rounded-xl bg-canvas hover:bg-subtle border border-stoneline text-[11px] font-semibold text-ink transition disabled:opacity-50"
+                    >
+                      {preset}
+                    </button>
+                  ))}
+                </div>
+
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    handleSendNote();
+                  }}
+                  className="flex items-center gap-2"
+                >
+                  <input
+                    type="text"
+                    maxLength={140}
+                    value={noteInput}
+                    onChange={(e) => setNoteInput(e.target.value)}
+                    placeholder="Write a live note or alert to all players..."
+                    className="flex-1 h-11 px-3.5 rounded-xl bg-canvas border border-stoneline text-xs font-medium text-ink focus:outline-none focus:border-cedar"
+                  />
+                  <button
+                    type="submit"
+                    disabled={!noteInput.trim() || pendingActionKey === 'SEND_NOTE'}
+                    className="btn-cedar h-11 px-4 rounded-xl text-xs font-bold shrink-0 disabled:opacity-45"
+                  >
+                    {pendingActionKey === 'SEND_NOTE' ? '⏳...' : '🔔 Send Note'}
+                  </button>
+                </form>
+
+                {snapshot.events && snapshot.events.length > 0 && (
+                  <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1 pt-1.5 border-t border-stoneline">
+                    {[...snapshot.events]
+                      .slice()
+                      .reverse()
+                      .map((evt) => (
+                        <div
+                          key={evt.id}
+                          className="p-2.5 rounded-xl bg-canvas border border-stoneline text-xs flex items-start justify-between gap-2"
+                        >
+                          <div className="space-y-0.5">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <strong className="font-bold text-ink">{evt.senderName}</strong>
+                              {evt.senderRole && (
+                                <span
+                                  className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${
+                                    evt.senderRole === 'HUNTER'
+                                      ? 'bg-hunter-light text-hunter'
+                                      : 'bg-cedar-light text-cedar'
+                                  }`}
+                                >
+                                  {evt.senderRole}
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-ink-secondary font-medium leading-snug">{evt.message}</p>
+                          </div>
+                          <span className="text-[10px] font-mono text-ink-muted shrink-0">
+                            {new Date(evt.createdAt).toLocaleTimeString([], {
+                              hour: '2-digit',
+                              minute: '2-digit',
+                              second: '2-digit',
+                            })}
+                          </span>
+                        </div>
+                      ))}
                   </div>
                 )}
               </div>
