@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 export interface MapParticipantMarker {
   id: string;
@@ -13,6 +13,25 @@ export interface MapParticipantMarker {
   ageSeconds: number;
   isStale: boolean;
 }
+
+export interface AuiLandmark {
+  id: string;
+  name: string;
+  category: string;
+  icon: string;
+  lat: number;
+  lng: number;
+}
+
+export const AUI_LANDMARKS: AuiLandmark[] = [
+  { id: 'gate', name: 'Main Gate & Security', category: 'Entrance', icon: '🚪', lat: 33.54130, lng: -5.10515 },
+  { id: 'mosque', name: 'AUI Grand Mosque', category: 'Worship', icon: '🕌', lat: 33.54070, lng: -5.10775 },
+  { id: 'library', name: 'Mohammed VI Library', category: 'Study', icon: '🏛️', lat: 33.53875, lng: -5.10705 },
+  { id: 'student_center', name: 'Student Center & Dining', category: 'Dining', icon: '🍽️', lat: 33.54035, lng: -5.10620 },
+  { id: 'quad', name: 'Academic Quad (Bldgs 1-8)', category: 'Classes', icon: '🎓', lat: 33.53965, lng: -5.10735 },
+  { id: 'sports', name: 'Sports Complex & Pool', category: 'Athletics', icon: '⚽', lat: 33.53995, lng: -5.10865 },
+  { id: 'dorms', name: 'Residence Halls (Dorms)', category: 'Housing', icon: '🏢', lat: 33.54085, lng: -5.10480 },
+];
 
 interface CampusMapProps {
   mode: 'setup' | 'gameplay';
@@ -52,6 +71,14 @@ function CampusMapInner({
   const lastCenterTsRef = useRef<number>(0);
   const lastFitCmdRef = useRef<number>(0);
 
+  const [mapLayer, setMapLayer] = useState<'street' | 'satellite'>('street');
+  const [showLandmarks, setShowLandmarks] = useState(false);
+
+  const streetLayerRef = useRef<any>(null);
+  const satLayerRef = useRef<any>(null);
+  const satLabelsRef = useRef<any>(null);
+  const landmarkMarkersRef = useRef<any[]>([]);
+
   const onSetupBoundaryMoveRef = useRef<CampusMapProps['onSetupBoundaryMove']>(onSetupBoundaryMove);
 
   useEffect(() => {
@@ -87,10 +114,29 @@ function CampusMapInner({
         L.control.zoom({ position: 'bottomleft' }).addTo(map);
       }
 
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      streetLayerRef.current = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxZoom: 19,
         attribution: '© OpenStreetMap',
-      }).addTo(map);
+      });
+
+      satLayerRef.current = L.tileLayer(
+        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        {
+          maxZoom: 19,
+          attribution: 'Tiles © Esri',
+        }
+      );
+
+      satLabelsRef.current = L.tileLayer(
+        'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+        {
+          maxZoom: 19,
+          attribution: '',
+        }
+      );
+
+      // Default street view
+      streetLayerRef.current.addTo(map);
 
       const circle = L.circle([boundary.lat, boundary.lng], {
         radius: boundary.radiusMeters,
@@ -158,9 +204,77 @@ function CampusMapInner({
         boundaryCircleRef.current = null;
         setupCenterMarkerRef.current = null;
         markersMapRef.current.clear();
+        landmarkMarkersRef.current = [];
       }
     };
   }, []);
+
+  // Toggle Satellite vs Street Layer
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    try {
+      if (mapLayer === 'satellite') {
+        if (streetLayerRef.current && map.hasLayer(streetLayerRef.current)) {
+          map.removeLayer(streetLayerRef.current);
+        }
+        if (satLayerRef.current && !map.hasLayer(satLayerRef.current)) {
+          satLayerRef.current.addTo(map);
+        }
+        if (satLabelsRef.current && !map.hasLayer(satLabelsRef.current)) {
+          satLabelsRef.current.addTo(map);
+        }
+      } else {
+        if (satLayerRef.current && map.hasLayer(satLayerRef.current)) {
+          map.removeLayer(satLayerRef.current);
+        }
+        if (satLabelsRef.current && map.hasLayer(satLabelsRef.current)) {
+          map.removeLayer(satLabelsRef.current);
+        }
+        if (streetLayerRef.current && !map.hasLayer(streetLayerRef.current)) {
+          streetLayerRef.current.addTo(map);
+        }
+      }
+    } catch {}
+  }, [mapLayer]);
+
+  // Toggle AUI Landmarks Markers
+  useEffect(() => {
+    const map = mapRef.current;
+    const L = leafletRef.current;
+    if (!map || !L) return;
+
+    // Clear existing landmark markers
+    landmarkMarkersRef.current.forEach((m) => {
+      try {
+        map.removeLayer(m);
+      } catch {}
+    });
+    landmarkMarkersRef.current = [];
+
+    if (showLandmarks) {
+      AUI_LANDMARKS.forEach((lm) => {
+        const html = `
+          <div style="display:inline-flex; align-items:center; gap:3px; background:rgba(15, 23, 42, 0.88); color:#FFFFFF; border:1.5px solid rgba(255, 255, 255, 0.45); border-radius:8px; padding:2.5px 6.5px; font-size:10.5px; font-weight:800; white-space:nowrap; box-shadow:0 3px 8px rgba(0,0,0,0.45); pointer-events:none;">
+            <span style="font-size:12px;">${lm.icon}</span>
+            <span>${lm.name}</span>
+          </div>
+        `;
+        const icon = L.divIcon({
+          html,
+          className: '',
+          iconSize: [120, 24],
+          iconAnchor: [60, 12],
+        });
+        const marker = L.marker([lm.lat, lm.lng], {
+          icon,
+          interactive: false,
+          zIndexOffset: 50, // Below player pins
+        }).addTo(map);
+        landmarkMarkersRef.current.push(marker);
+      });
+    }
+  }, [showLandmarks]);
 
   useEffect(() => {
     if (!boundaryCircleRef.current) return;
@@ -199,7 +313,7 @@ function CampusMapInner({
 
       const activeIds = new Set<string>();
 
-      // Compute spiderfy/offset positions when multiple players share nearly identical coordinates
+      // Spiderfy overlapping markers
       const displayCoords = new Map<string, { lat: number; lng: number }>();
       const clusterRadiusDeg = 0.000065; // ~7 meters visual separation
       const thresholdDeg = 0.00009; // ~10 meters grouping threshold
@@ -339,11 +453,33 @@ function CampusMapInner({
   }, [mode, markers]);
 
   return (
-    <div
-      ref={containerRef}
-      style={{ position: 'relative', zIndex: 1, isolation: 'isolate' }}
-      className={`map-stack-container w-full h-full ${mode === 'setup' ? 'cursor-crosshair' : ''}`}
-    />
+    <div style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden' }}>
+      <div
+        ref={containerRef}
+        style={{ position: 'relative', zIndex: 1, isolation: 'isolate', width: '100%', height: '100%' }}
+        className={`map-stack-container w-full h-full ${mode === 'setup' ? 'cursor-crosshair' : ''}`}
+      />
+      <div className="absolute top-3 right-3 z-[1000] flex items-center gap-1.5 pointer-events-auto">
+        <button
+          type="button"
+          onClick={() => setMapLayer((prev) => (prev === 'street' ? 'satellite' : 'street'))}
+          className="h-8 px-2.5 rounded-lg bg-white/95 backdrop-blur border border-stone-300 shadow-md text-xs font-bold text-stone-800 hover:bg-stone-100 transition flex items-center gap-1 select-none"
+        >
+          <span>{mapLayer === 'street' ? '🛰️ Satellite' : '🗺️ Map'}</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setShowLandmarks((prev) => !prev)}
+          className={`h-8 px-2.5 rounded-lg backdrop-blur border shadow-md text-xs font-bold transition flex items-center gap-1 select-none ${
+            showLandmarks
+              ? 'bg-emerald-800 text-white border-emerald-900 shadow-emerald-900/30'
+              : 'bg-white/95 border-stone-300 text-stone-800 hover:bg-stone-100'
+          }`}
+        >
+          <span>📍 AUI Landmarks</span>
+        </button>
+      </div>
+    </div>
   );
 }
 

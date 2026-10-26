@@ -9,19 +9,60 @@ export type HunterVisibilityMode = 'ALWAYS_LIVE' | 'RADAR_PING_15S' | 'HIDDEN';
 export type TauntType = 'CATCH_ME' | 'I_SEE_YOU' | 'AIRHORN' | 'TOO_SLOW';
 
 export const AUI_CAMPUS_PRESETS = {
-  main: { name: 'Full AUI Campus', lat: 33.53955, lng: -5.10685, radiusMeters: 390, zoom: 16 },
-  academic: { name: 'Academic Quad & Library', lat: 33.53965, lng: -5.1073, radiusMeters: 165, zoom: 17 },
-  housing: { name: 'Student Center & Dorms', lat: 33.54035, lng: -5.1062, radiusMeters: 195, zoom: 17 },
-  athletic: { name: 'Athletic Complex & Fields', lat: 33.53995, lng: -5.10865, radiusMeters: 160, zoom: 17 },
+  main: { name: 'Full AUI Campus', lat: 33.53960, lng: -5.10695, radiusMeters: 380, zoom: 16 },
+  academic: { name: 'Academic Quad & Library', lat: 33.53965, lng: -5.10735, radiusMeters: 165, zoom: 17 },
+  housing: { name: 'Student Center & Dorms', lat: 33.54035, lng: -5.10620, radiusMeters: 195, zoom: 17 },
+  athletic: { name: 'Athletic Complex & Fields', lat: 33.53995, lng: -5.10865, radiusMeters: 165, zoom: 17 },
 } as const;
 
 export type CampusPresetKey = keyof typeof AUI_CAMPUS_PRESETS;
+
+const BLOCKED_WORDS = [
+  // English profanities & slurs
+  'fuck', 'shit', 'bitch', 'asshole', 'dick', 'pussy', 'cunt', 'nigger', 'nigga',
+  'faggot', 'fag', 'whore', 'slut', 'bastard', 'cock', 'twat', 'wanker',
+  // French profanities
+  'merde', 'putain', 'salope', 'connard', 'conne', 'encule', 'batard', 'pute', 'chienne',
+  // Darija / Arabic transliterated profanities
+  'zamel', 'zaml', 'kahba', 'qahba', '9ahba', 'tabon', 'tebon', 'zeb', 'zob', 'zbi',
+  'nik', 'nikmk', 'weldlhram', 'weldrab', 'tezz', 'hmar', 'kelb', 'klb'
+];
+
+/**
+ * Strict profanity check normalizing leetspeak, punctuation, and repeated characters.
+ */
+export function containsProfanity(raw: string): boolean {
+  if (!raw) return false;
+  // Normalize leetspeak and symbols
+  let text = raw.toLowerCase()
+    .replace(/[@4]/g, 'a')
+    .replace(/[\$5]/g, 's')
+    .replace(/[0]/g, 'o')
+    .replace(/[1!|]/g, 'i')
+    .replace(/[3]/g, 'e')
+    .replace(/[7]/g, 't')
+    .replace(/[8]/g, 'b')
+    .replace(/[^a-z0-9]/g, '');
+
+  // Collapse consecutive duplicated characters (e.g. fuuuuck -> fuck)
+  const collapsed = text.replace(/(.)\1+/g, '$1');
+
+  for (const word of BLOCKED_WORDS) {
+    if (text.includes(word) || collapsed.includes(word)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export const NicknameSchema = z
   .string()
   .trim()
   .min(3, 'Nickname must be at least 3 characters.')
-  .max(15, 'Nickname cannot exceed 15 characters.');
+  .max(15, 'Nickname cannot exceed 15 characters.')
+  .refine((val) => !containsProfanity(val), {
+    message: 'Nickname contains inappropriate or offensive language.',
+  });
 
 export const CreateGameSchema = z.object({
   hostNickname: NicknameSchema,
@@ -75,6 +116,25 @@ export const GameActionSchema = z.discriminatedUnion('action', [
     participantId: z.string().min(1),
     hunterCount: z.coerce.number().int().min(1).max(5),
     durationMinutes: z.coerce.number().int().min(5).max(90),
+    countdownSeconds: z.coerce.number().int().min(0).max(120).optional(),
+    gpsIntervalSeconds: z.coerce.number().int().min(10).max(300).optional(),
+    soundUses: z.coerce.number().int().min(1).max(10).optional(),
+    soundCooldownSeconds: z.coerce.number().int().min(30).max(300).optional(),
+    photoRequestsPerHider: z.coerce.number().int().min(0).max(5).optional(),
+    ghostCloakUsesPerHider: z.coerce.number().int().min(0).max(5).optional(),
+    walkieTalkieEnabled: z.boolean().optional(),
+    hunterVisibilityMode: z.enum(['ALWAYS_LIVE', 'RADAR_PING_15S', 'HIDDEN']).optional(),
+    catchVerificationMode: z.enum(['PROXIMITY_20M', 'CATCH_PIN', 'INSTANT_TAP']).optional(),
+    outOfBoundsGraceSeconds: z.coerce.number().int().min(15).max(180).optional(),
+    teammateVisibility: z.enum(['SHOW_TEAMMATES', 'HIDE_TEAMMATES']).optional(),
+    shrinkingZone: z.boolean().optional(),
+    boundaryRadiusMeters: z.coerce.number().int().min(80).max(1500).optional(),
+  }),
+  z.object({
+    action: z.literal('UPDATE_LOBBY_SETTINGS'),
+    participantId: z.string().min(1),
+    hunterCount: z.coerce.number().int().min(1).max(5).optional(),
+    durationMinutes: z.coerce.number().int().min(5).max(90).optional(),
     countdownSeconds: z.coerce.number().int().min(0).max(120).optional(),
     gpsIntervalSeconds: z.coerce.number().int().min(10).max(300).optional(),
     soundUses: z.coerce.number().int().min(1).max(10).optional(),

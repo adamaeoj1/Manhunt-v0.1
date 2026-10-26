@@ -104,6 +104,37 @@ class ManhuntSoundEngine {
     return this.masterGain;
   }
 
+  /**
+   * Automatically schedule disconnection and cleanup of Web Audio nodes
+   * immediately when playback ends to completely prevent memory leaks.
+   */
+  private scheduleNodeCleanup(
+    sourceNode: AudioScheduledSourceNode | AudioNode,
+    nodesToDisconnect: (AudioNode | null | undefined)[],
+    durationSeconds = 1.0
+  ): void {
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      try {
+        if ('disconnect' in sourceNode) sourceNode.disconnect();
+      } catch {}
+      nodesToDisconnect.forEach((node) => {
+        if (node) {
+          try {
+            node.disconnect();
+          } catch {}
+        }
+      });
+    };
+
+    if ('onended' in sourceNode) {
+      (sourceNode as AudioScheduledSourceNode).onended = cleanup;
+    }
+    setTimeout(cleanup, Math.ceil((durationSeconds + 0.15) * 1000));
+  }
+
   public isUnlocked(): boolean {
     return this.unlocked || Boolean(this.ctx && this.ctx.state === 'running');
   }
@@ -166,6 +197,7 @@ class ManhuntSoundEngine {
         gain.connect(dest);
         osc.start(start);
         osc.stop(start + duration);
+        this.scheduleNodeCleanup(osc, [gain], idx * 0.09 + duration);
       });
 
       this.vibrate([80]);
@@ -209,6 +241,7 @@ class ManhuntSoundEngine {
         gain.connect(dest);
         osc.start(start);
         osc.stop(start + dur);
+        this.scheduleNodeCleanup(osc, [gain], offset + dur);
       });
 
       this.vibrate([100, 50, 120]);
@@ -272,6 +305,9 @@ class ManhuntSoundEngine {
       osc.stop(now + durationSeconds);
       subOsc.stop(now + durationSeconds);
 
+      this.scheduleNodeCleanup(osc, [gain], durationSeconds);
+      this.scheduleNodeCleanup(subOsc, [], durationSeconds);
+
       this.vibrate([400, 150, 400, 150, 600]);
       return true;
     } catch {
@@ -323,6 +359,7 @@ class ManhuntSoundEngine {
         gain.connect(dest);
         osc.start(start);
         osc.stop(start + dur);
+        this.scheduleNodeCleanup(osc, [gain], offset + dur);
       });
 
       if (intensity === 'CRITICAL') {
@@ -369,6 +406,7 @@ class ManhuntSoundEngine {
         gain.connect(dest);
         osc.start(start);
         osc.stop(start + dur);
+        this.scheduleNodeCleanup(osc, [gain], idx * 0.07 + dur);
       });
 
       this.vibrate([120, 60, 120]);
@@ -414,6 +452,7 @@ class ManhuntSoundEngine {
         gain.connect(dest);
         osc.start(start);
         osc.stop(start + dur);
+        this.scheduleNodeCleanup(osc, [gain], offset + dur);
       });
 
       this.vibrate([250, 100, 250]);
@@ -454,6 +493,7 @@ class ManhuntSoundEngine {
       gain.connect(dest);
       osc.start(now);
       osc.stop(now + dur);
+      this.scheduleNodeCleanup(osc, [gain], dur);
       return true;
     } catch {
       return false;
@@ -495,6 +535,7 @@ class ManhuntSoundEngine {
         gain.connect(dest);
         osc.start(start);
         osc.stop(start + dur);
+        this.scheduleNodeCleanup(osc, [gain], idx * 0.11 + dur);
       });
 
       this.vibrate(type === 'START' ? [200, 100, 300] : [300, 120, 300]);
@@ -544,6 +585,7 @@ class ManhuntSoundEngine {
           osc.connect(gain);
           osc.start(start);
           osc.stop(start + dur);
+          this.scheduleNodeCleanup(osc, idx === 0 ? [gain] : [], offset + dur);
         });
       });
 
@@ -595,6 +637,7 @@ class ManhuntSoundEngine {
       noiseGain.connect(dest);
       noiseSource.start(now);
       noiseSource.stop(now + noiseDur);
+      this.scheduleNodeCleanup(noiseSource, [filter, noiseGain], noiseDur);
 
       // PTT Chirp tones
       const tones = phase === 'START' ? [1420, 1880] : [1880, 1320];
@@ -615,6 +658,7 @@ class ManhuntSoundEngine {
         gain.connect(dest);
         osc.start(start);
         osc.stop(start + dur);
+        this.scheduleNodeCleanup(osc, [gain], 0.03 + idx * 0.045 + dur);
       });
 
       this.vibrate(phase === 'START' ? [45] : [30, 30]);
@@ -676,6 +720,7 @@ class ManhuntSoundEngine {
             gain.connect(dest);
             osc.start(start);
             osc.stop(start + dur);
+            this.scheduleNodeCleanup(osc, [filter, gain], idx * 0.22 + dur);
           });
         }
         setTimeout(finishPlayback, 1650);
@@ -712,9 +757,19 @@ class ManhuntSoundEngine {
           boostGain.connect(dest);
 
           source.onended = () => {
+            try {
+              source.disconnect();
+              radioFilter.disconnect();
+              boostGain.disconnect();
+            } catch {}
             finishPlayback();
           };
           source.start(ctx.currentTime + 0.12);
+          this.scheduleNodeCleanup(
+            source,
+            [radioFilter, boostGain],
+            decodedBuffer.duration / (disguisePitch ? 0.78 : 1.0) + 0.5
+          );
           return true;
         } catch {
           // Fall through to HTMLAudioElement fallback if decodeAudioData encounters codec issues
@@ -845,6 +900,7 @@ class ManhuntSoundEngine {
           gain.connect(dest);
           osc.start(start);
           osc.stop(start + dur);
+          this.scheduleNodeCleanup(osc, [gain], offset + dur);
         });
         this.vibrate([90, 50, 90, 50, 140]);
       } else if (tauntType === 'I_SEE_YOU') {
@@ -872,6 +928,8 @@ class ManhuntSoundEngine {
           osc2.start(start);
           osc1.stop(start + dur);
           osc2.stop(start + dur);
+          this.scheduleNodeCleanup(osc1, [gain], offset + dur);
+          this.scheduleNodeCleanup(osc2, [], offset + dur);
         });
         this.vibrate([180, 90, 260]);
       } else if (tauntType === 'AIRHORN') {
@@ -891,7 +949,7 @@ class ManhuntSoundEngine {
           gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
           gain.connect(dest);
 
-          chordFreqs.forEach((freq) => {
+          chordFreqs.forEach((freq, idx) => {
             const osc = ctx.createOscillator();
             osc.type = 'sawtooth';
             osc.frequency.setValueAtTime(freq * 0.97, start);
@@ -899,6 +957,7 @@ class ManhuntSoundEngine {
             osc.connect(gain);
             osc.start(start);
             osc.stop(start + dur);
+            this.scheduleNodeCleanup(osc, idx === 0 ? [gain] : [], offset + dur);
           });
         });
         this.vibrate([120, 60, 120, 60, 400]);
@@ -919,6 +978,7 @@ class ManhuntSoundEngine {
         gain.connect(dest);
         osc.start(now);
         osc.stop(now + 0.6);
+        this.scheduleNodeCleanup(osc, [gain], 0.65);
         this.vibrate([70, 40, 180]);
       }
 

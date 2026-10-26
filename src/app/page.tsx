@@ -25,6 +25,20 @@ const TAUNT_OPTIONS: Array<{ type: TauntType; label: string; emoji: string }> = 
   { type: 'TOO_SLOW', label: 'Too Slow!', emoji: '👻' },
 ];
 
+const HUNTER_CALLOUT_CHIPS: string[] = [
+  'Spotted near library!',
+  'Moving towards sports complex!',
+  'Flanking left!',
+  'I need backup here!',
+];
+
+const HIDER_CALLOUT_CHIPS: string[] = [
+  'Hunter approaching!',
+  'Relocating now!',
+  'All clear in the dorms!',
+  'Catch me if you can!',
+];
+
 const QUICK_NOTE_PRESETS: string[] = [
   '📍 Moving toward Academic Quad & Library',
   '👀 Hunter spotted near Student Center!',
@@ -32,13 +46,15 @@ const QUICK_NOTE_PRESETS: string[] = [
   '⚠️ Watch the green campus boundary!',
 ];
 
-const SILENT_RADIO_CALLOUTS: string[] = [
-  '📍 Hunter near Academic Quad!',
-  '👀 Hunter spotted at Library!',
-  '🏃 Relocating to building 8!',
-  '🤫 Quiet! Hunter is within 30m!',
-  '🛡️ Area looks clear right now',
+const QUICK_RADIO_TRANSMITS: string[] = [
+  'Spotted near library!',
+  'Moving towards sports complex!',
+  'Hunter approaching!',
+  'Relocating now!',
+  'All clear in the dorms!',
+  'Catch me if you can!',
 ];
+const SILENT_RADIO_CALLOUTS = QUICK_RADIO_TRANSMITS;
 
 interface GameEventItem {
   id: string;
@@ -122,7 +138,9 @@ interface GameSnapshot {
   serverTime?: number;
   serverNowMs?: number;
   headStartEndsAtMs?: number | null;
+  headStartEndsAt?: number | null;
   gameEndsAtMs?: number | null;
+  endsAt?: number | null;
   pausedRemainingMs?: number | null;
   hostId: string;
   viewerId: string;
@@ -183,6 +201,7 @@ interface GameSnapshot {
     senderNickname: string;
     senderRole: 'HUNTER' | 'HIDER' | null;
     audioDataUrl?: string;
+    hasAudio?: boolean;
     voiceText?: string;
     disguised: boolean;
     durationSeconds: number;
@@ -193,7 +212,9 @@ interface GameSnapshot {
     senderId: string;
     senderNickname: string;
     senderRole: 'HUNTER' | 'HIDER' | null;
-    audioDataUrl: string;
+    audioDataUrl?: string;
+    hasAudio?: boolean;
+    voiceText?: string;
     disguised: boolean;
     durationSeconds: number;
     createdAt: number;
@@ -213,6 +234,23 @@ interface GameSnapshot {
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
   userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+}
+
+export interface LocalLobbySettings {
+  hunterCount: number;
+  durationMinutes: number;
+  countdownSeconds: number;
+  gpsIntervalSeconds: number;
+  soundUsesPerHunter: number;
+  soundCooldownSeconds: number;
+  photoRequestsPerHider: number;
+  ghostCloakUsesPerHider: number;
+  walkieTalkieEnabled: boolean;
+  hunterVisibilityMode: HunterVisibilityMode;
+  catchVerificationMode: CatchVerificationMode;
+  outOfBoundsGraceSeconds: number;
+  teammateVisibility: TeammateVisibilityMode;
+  shrinkingZone: boolean;
 }
 
 const TAB_SESSION_STORAGE_KEY = 'aui_manhunt_tab_session_v1';
@@ -244,7 +282,9 @@ function computeTargetRemainingSeconds(
 const SmoothCountdownHeaderTicker = React.memo(function SmoothCountdownHeaderTicker({
   state,
   headStartEndsAtMs,
+  headStartEndsAt,
   gameEndsAtMs,
+  endsAt,
   pausedRemainingMs,
   fallbackCountdownSeconds,
   fallbackGameSeconds,
@@ -253,23 +293,28 @@ const SmoothCountdownHeaderTicker = React.memo(function SmoothCountdownHeaderTic
 }: {
   state: 'LOBBY' | 'COUNTDOWN' | 'ACTIVE' | 'PAUSED' | 'FINISHED';
   headStartEndsAtMs?: number | null;
+  headStartEndsAt?: number | null;
   gameEndsAtMs?: number | null;
+  endsAt?: number | null;
   pausedRemainingMs?: number | null;
   fallbackCountdownSeconds: number;
   fallbackGameSeconds: number;
   serverTimeOffsetMs: number;
   onCountdownZero?: () => void;
 }) {
+  const targetHead = headStartEndsAtMs ?? headStartEndsAt;
+  const targetGame = gameEndsAtMs ?? endsAt;
+
   const [displaySecs, setDisplaySecs] = useState<number>(() => {
     if (state === 'COUNTDOWN') {
-      return computeTargetRemainingSeconds(headStartEndsAtMs, serverTimeOffsetMs, fallbackCountdownSeconds);
+      return computeTargetRemainingSeconds(targetHead, serverTimeOffsetMs, fallbackCountdownSeconds);
     }
     if (state === 'PAUSED') {
       return typeof pausedRemainingMs === 'number'
         ? Math.max(0, Math.ceil(pausedRemainingMs / 1000))
         : Math.max(0, Math.floor(fallbackGameSeconds));
     }
-    return computeTargetRemainingSeconds(gameEndsAtMs, serverTimeOffsetMs, fallbackGameSeconds);
+    return computeTargetRemainingSeconds(targetGame, serverTimeOffsetMs, fallbackGameSeconds);
   });
 
   const lastBeepSecRef = useRef<number | null>(null);
@@ -278,12 +323,12 @@ const SmoothCountdownHeaderTicker = React.memo(function SmoothCountdownHeaderTic
   useEffect(() => {
     zeroTriggeredRef.current = false;
     lastBeepSecRef.current = null;
-  }, [state, headStartEndsAtMs]);
+  }, [state, targetHead]);
 
   useEffect(() => {
     const tick = () => {
       if (state === 'COUNTDOWN') {
-        const secs = computeTargetRemainingSeconds(headStartEndsAtMs, serverTimeOffsetMs, fallbackCountdownSeconds);
+        const secs = computeTargetRemainingSeconds(targetHead, serverTimeOffsetMs, fallbackCountdownSeconds);
         setDisplaySecs((prev) => (prev !== secs ? secs : prev));
         if (secs >= 1 && secs <= 10 && lastBeepSecRef.current !== secs) {
           lastBeepSecRef.current = secs;
@@ -300,18 +345,18 @@ const SmoothCountdownHeaderTicker = React.memo(function SmoothCountdownHeaderTic
             : Math.max(0, Math.floor(fallbackGameSeconds));
         setDisplaySecs((prev) => (prev !== secs ? secs : prev));
       } else if (state === 'ACTIVE') {
-        const secs = computeTargetRemainingSeconds(gameEndsAtMs, serverTimeOffsetMs, fallbackGameSeconds);
+        const secs = computeTargetRemainingSeconds(targetGame, serverTimeOffsetMs, fallbackGameSeconds);
         setDisplaySecs((prev) => (prev !== secs ? secs : prev));
       }
     };
 
     tick();
-    const timer = setInterval(tick, 250);
+    const timer = setInterval(tick, 200);
     return () => clearInterval(timer);
   }, [
     state,
-    headStartEndsAtMs,
-    gameEndsAtMs,
+    targetHead,
+    targetGame,
     pausedRemainingMs,
     fallbackCountdownSeconds,
     fallbackGameSeconds,
@@ -337,7 +382,9 @@ const RoleRevealCountdownCard = React.memo(function RoleRevealCountdownCard({
   state,
   isHunter,
   headStartEndsAtMs,
+  headStartEndsAt,
   gameEndsAtMs,
+  endsAt,
   pausedRemainingMs,
   fallbackCountdownSeconds,
   fallbackGameSeconds,
@@ -348,7 +395,9 @@ const RoleRevealCountdownCard = React.memo(function RoleRevealCountdownCard({
   state: 'LOBBY' | 'COUNTDOWN' | 'ACTIVE' | 'PAUSED' | 'FINISHED';
   isHunter: boolean;
   headStartEndsAtMs?: number | null;
+  headStartEndsAt?: number | null;
   gameEndsAtMs?: number | null;
+  endsAt?: number | null;
   pausedRemainingMs?: number | null;
   fallbackCountdownSeconds: number;
   fallbackGameSeconds: number;
@@ -356,11 +405,14 @@ const RoleRevealCountdownCard = React.memo(function RoleRevealCountdownCard({
   onCountdownZero?: () => void;
   onOpenMap: () => void;
 }) {
+  const targetHead = headStartEndsAtMs ?? headStartEndsAt;
+  const targetGame = gameEndsAtMs ?? endsAt;
+
   const [countdownSecs, setCountdownSecs] = useState<number>(() =>
-    computeTargetRemainingSeconds(headStartEndsAtMs, serverTimeOffsetMs, fallbackCountdownSeconds)
+    computeTargetRemainingSeconds(targetHead, serverTimeOffsetMs, fallbackCountdownSeconds)
   );
   const [gameSecs, setGameSecs] = useState<number>(() =>
-    computeTargetRemainingSeconds(gameEndsAtMs, serverTimeOffsetMs, fallbackGameSeconds)
+    computeTargetRemainingSeconds(targetGame, serverTimeOffsetMs, fallbackGameSeconds)
   );
   const lastBeepSecRef = useRef<number | null>(null);
   const zeroTriggeredRef = useRef(false);
@@ -368,12 +420,12 @@ const RoleRevealCountdownCard = React.memo(function RoleRevealCountdownCard({
   useEffect(() => {
     zeroTriggeredRef.current = false;
     lastBeepSecRef.current = null;
-  }, [state, headStartEndsAtMs]);
+  }, [state, targetHead]);
 
   useEffect(() => {
     const tick = () => {
       if (state === 'COUNTDOWN') {
-        const secs = computeTargetRemainingSeconds(headStartEndsAtMs, serverTimeOffsetMs, fallbackCountdownSeconds);
+        const secs = computeTargetRemainingSeconds(targetHead, serverTimeOffsetMs, fallbackCountdownSeconds);
         setCountdownSecs((prev) => (prev !== secs ? secs : prev));
         if (secs >= 1 && secs <= 10 && lastBeepSecRef.current !== secs) {
           lastBeepSecRef.current = secs;
@@ -390,18 +442,18 @@ const RoleRevealCountdownCard = React.memo(function RoleRevealCountdownCard({
             : Math.max(0, Math.floor(fallbackGameSeconds));
         setGameSecs((prev) => (prev !== secs ? secs : prev));
       } else {
-        const secs = computeTargetRemainingSeconds(gameEndsAtMs, serverTimeOffsetMs, fallbackGameSeconds);
+        const secs = computeTargetRemainingSeconds(targetGame, serverTimeOffsetMs, fallbackGameSeconds);
         setGameSecs((prev) => (prev !== secs ? secs : prev));
       }
     };
 
     tick();
-    const timer = setInterval(tick, 250);
+    const timer = setInterval(tick, 200);
     return () => clearInterval(timer);
   }, [
     state,
-    headStartEndsAtMs,
-    gameEndsAtMs,
+    targetHead,
+    targetGame,
     pausedRemainingMs,
     fallbackCountdownSeconds,
     fallbackGameSeconds,
@@ -446,27 +498,30 @@ const RoleRevealCountdownCard = React.memo(function RoleRevealCountdownCard({
  */
 const HunterLockedMapCountdownOverlay = React.memo(function HunterLockedMapCountdownOverlay({
   headStartEndsAtMs,
+  headStartEndsAt,
   fallbackCountdownSeconds,
   serverTimeOffsetMs,
   onCountdownZero,
 }: {
   headStartEndsAtMs?: number | null;
+  headStartEndsAt?: number | null;
   fallbackCountdownSeconds: number;
   serverTimeOffsetMs: number;
   onCountdownZero?: () => void;
 }) {
+  const targetHead = headStartEndsAtMs ?? headStartEndsAt;
   const [secsLeft, setSecsLeft] = useState<number>(() =>
-    computeTargetRemainingSeconds(headStartEndsAtMs, serverTimeOffsetMs, fallbackCountdownSeconds)
+    computeTargetRemainingSeconds(targetHead, serverTimeOffsetMs, fallbackCountdownSeconds)
   );
   const zeroTriggeredRef = useRef(false);
 
   useEffect(() => {
     zeroTriggeredRef.current = false;
-  }, [headStartEndsAtMs]);
+  }, [targetHead]);
 
   useEffect(() => {
     const tick = () => {
-      const secs = computeTargetRemainingSeconds(headStartEndsAtMs, serverTimeOffsetMs, fallbackCountdownSeconds);
+      const secs = computeTargetRemainingSeconds(targetHead, serverTimeOffsetMs, fallbackCountdownSeconds);
       setSecsLeft((prev) => (prev !== secs ? secs : prev));
       if (secs <= 0 && !zeroTriggeredRef.current) {
         zeroTriggeredRef.current = true;
@@ -474,9 +529,9 @@ const HunterLockedMapCountdownOverlay = React.memo(function HunterLockedMapCount
       }
     };
     tick();
-    const timer = setInterval(tick, 250);
+    const timer = setInterval(tick, 200);
     return () => clearInterval(timer);
-  }, [headStartEndsAtMs, fallbackCountdownSeconds, serverTimeOffsetMs, onCountdownZero]);
+  }, [targetHead, fallbackCountdownSeconds, serverTimeOffsetMs, onCountdownZero]);
 
   return (
     <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center bg-stone-900/90 text-white">
@@ -517,7 +572,7 @@ function AuiManhuntApp() {
   const [knownPlayerIds, setKnownPlayerIds] = useState<string[]>([]);
   const [snapshot, setSnapshot] = useState<GameSnapshot | null>(null);
   const [dismissedRoleForPlayers, setDismissedRoleForPlayers] = useState<Record<string, boolean>>({});
-  const [activeTab, setActiveTab] = useState<'radio' | 'players' | 'feed' | 'safety'>('radio');
+  const [activeTab, setActiveTab] = useState<'players' | 'radio' | 'safety'>('players');
   const [sessionHydrated, setSessionHydrated] = useState(false);
 
   // Setup state
@@ -675,6 +730,7 @@ function AuiManhuntApp() {
     nickname: string;
     role: string;
     disguised: boolean;
+    voiceText?: string;
   } | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const walkieStreamRef = useRef<MediaStream | null>(null);
@@ -684,6 +740,18 @@ function AuiManhuntApp() {
   const walkieTickTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const playedWalkieIdsRef = useRef<Set<string>>(new Set());
   const playedTauntIdsRef = useRef<Set<string>>(new Set());
+
+  // Walkie-Talkie last audio buffer for Replay Last
+  const lastRadioAudioRef = useRef<{ audioDataUrl: string; disguised: boolean } | null>(null);
+
+  // Host Lobby Settings live editing & debounce lock
+  const [hostSettingsOpen, setHostSettingsOpen] = useState(false);
+  const [localLobbySettings, setLocalLobbySettings] = useState<LocalLobbySettings | null>(null);
+  const localLobbySettingsRef = useRef<LocalLobbySettings | null>(null);
+  const settingsMutationLockUntilRef = useRef<number>(0);
+  const settingsDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [lobbySettingsSaveStatus, setLobbySettingsSaveStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const saveStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [isOnline, setIsOnline] = useState(true);
   const [gpsInFlight, setGpsInFlight] = useState(false);
@@ -830,8 +898,38 @@ function AuiManhuntApp() {
       if (pollAbortControllerRef.current) {
         pollAbortControllerRef.current.abort();
       }
+      if (settingsDebounceTimerRef.current) {
+        clearTimeout(settingsDebounceTimerRef.current);
+      }
+      if (saveStatusTimerRef.current) {
+        clearTimeout(saveStatusTimerRef.current);
+      }
     };
   }, []);
+
+  // Sync snapshot settings to localLobbySettings when mutation lock is inactive
+  useEffect(() => {
+    if (snapshot?.settings && Date.now() >= settingsMutationLockUntilRef.current) {
+      const synced: LocalLobbySettings = {
+        hunterCount: snapshot.settings.hunterCount,
+        durationMinutes: snapshot.settings.durationMinutes,
+        countdownSeconds: snapshot.settings.countdownSeconds,
+        gpsIntervalSeconds: snapshot.settings.gpsIntervalSeconds,
+        soundUsesPerHunter: snapshot.settings.soundUsesPerHunter,
+        soundCooldownSeconds: snapshot.settings.soundCooldownSeconds,
+        photoRequestsPerHider: snapshot.settings.photoRequestsPerHider ?? 1,
+        ghostCloakUsesPerHider: snapshot.settings.ghostCloakUsesPerHider ?? 1,
+        walkieTalkieEnabled: snapshot.settings.walkieTalkieEnabled !== false,
+        hunterVisibilityMode: snapshot.settings.hunterVisibilityMode || 'ALWAYS_LIVE',
+        catchVerificationMode: snapshot.settings.catchVerificationMode || 'PROXIMITY_20M',
+        outOfBoundsGraceSeconds: snapshot.settings.outOfBoundsGraceSeconds || 60,
+        teammateVisibility: snapshot.settings.teammateVisibility || 'SHOW_TEAMMATES',
+        shrinkingZone: Boolean(snapshot.settings.shrinkingZone),
+      };
+      setLocalLobbySettings(synced);
+      localLobbySettingsRef.current = synced;
+    }
+  }, [snapshot?.settings]);
 
   // Global first-interaction AudioContext auto-unlock & state sync
   useEffect(() => {
@@ -903,6 +1001,9 @@ function AuiManhuntApp() {
       setActivePlayerId(restoredPlayerId);
       setKnownPlayerIds(restoredKnownIds);
       setDismissedRoleForPlayers(restoredDismissed);
+      if (typeof window !== 'undefined') {
+        window.history.replaceState(null, '', `/?room=${encodeURIComponent(restoredRoom)}`);
+      }
     } else if (rawRoomParam) {
       setScreen('JOIN');
     }
@@ -1187,6 +1288,12 @@ function AuiManhuntApp() {
         if (data.snapshot) {
           const inClearGrace = Date.now() < gpsClearGraceUntilRef.current;
           const nextSnap = hydrateSnapshotWithMediaCache(data.snapshot, pid);
+          if (Date.now() < settingsMutationLockUntilRef.current && localLobbySettingsRef.current) {
+            nextSnap.settings = {
+              ...nextSnap.settings,
+              ...localLobbySettingsRef.current,
+            };
+          }
           setSnapshot(nextSnap);
           if (nextSnap.viewerGpsDenied && !inClearGrace) {
             gpsDeniedRef.current = true;
@@ -1281,13 +1388,27 @@ function AuiManhuntApp() {
     if (snapshot.viewerRole === 'HUNTER') {
       for (const p of snapshot.participants) {
         const pr = p.photoRequest;
-        if (pr && pr.status === 'SUBMITTED' && pr.hasPhoto && pr.photoDataUrl) {
+        if (pr && pr.status === 'SUBMITTED' && pr.hasPhoto) {
           if (!notifiedSubmittedPhotoIdsRef.current.has(pr.id)) {
             notifiedSubmittedPhotoIdsRef.current.add(pr.id);
             playedSpecificAlertThisCycle = true;
             soundEngine.playPhotoRequestAlert();
-            showToast(`📷 ${p.nickname} submitted a surroundings photo! Opening intel view...`, 'info');
-            setViewerPhotoModal({ nickname: p.nickname, url: pr.photoDataUrl });
+            if (pr.photoDataUrl) {
+              photoCacheRef.current.set(pr.id, pr.photoDataUrl);
+              showToast(`📷 ${p.nickname} submitted a surroundings photo! Opening intel view...`, 'info');
+              setViewerPhotoModal({ nickname: p.nickname, url: pr.photoDataUrl });
+            } else if (snapshot.code) {
+              fetch(`/api/games?code=${encodeURIComponent(snapshot.code)}&photoRequestId=${encodeURIComponent(pr.id)}`)
+                .then((r) => r.json())
+                .then((data) => {
+                  if (data?.photo?.photoDataUrl) {
+                    photoCacheRef.current.set(pr.id, data.photo.photoDataUrl);
+                    showToast(`📷 ${p.nickname} submitted a surroundings photo! Opening intel view...`, 'info');
+                    setViewerPhotoModal({ nickname: p.nickname, url: data.photo.photoDataUrl });
+                  }
+                })
+                .catch(() => {});
+            }
           }
         }
       }
@@ -1304,6 +1425,7 @@ function AuiManhuntApp() {
           nickname: clip.senderNickname,
           role: roleLabel,
           disguised: clip.disguised,
+          voiceText: clip.voiceText,
         });
         const onEnd = () => {
           setActiveWalkieSpeaker((prev) =>
@@ -1311,7 +1433,24 @@ function AuiManhuntApp() {
           );
         };
         if (clip.audioDataUrl) {
+          lastRadioAudioRef.current = {
+            audioDataUrl: clip.audioDataUrl,
+            disguised: clip.disguised,
+          };
           soundEngine.playWalkieTalkieAudio(clip.audioDataUrl, clip.disguised, onEnd);
+        } else if (clip.hasAudio && snapshot.code) {
+          fetch(`/api/games?code=${encodeURIComponent(snapshot.code)}&clipId=${encodeURIComponent(clip.id)}`)
+            .then((r) => r.json())
+            .then((data) => {
+              if (data?.clip?.audioDataUrl) {
+                lastRadioAudioRef.current = {
+                  audioDataUrl: data.clip.audioDataUrl,
+                  disguised: clip.disguised,
+                };
+                soundEngine.playWalkieTalkieAudio(data.clip.audioDataUrl, clip.disguised, onEnd);
+              }
+            })
+            .catch(() => {});
         } else if (clip.voiceText) {
           soundEngine.playSilentRadioTTS(clip.voiceText, clip.disguised, onEnd);
         }
@@ -1327,11 +1466,31 @@ function AuiManhuntApp() {
             role: roleLabel,
             disguised: msg.disguised,
           });
-          soundEngine.playWalkieTalkieAudio(msg.audioDataUrl, msg.disguised, () => {
+          const onMsgEnd = () => {
             setActiveWalkieSpeaker((prev) =>
               prev && prev.nickname === msg.senderNickname ? null : prev
             );
-          });
+          };
+          if (msg.audioDataUrl) {
+            lastRadioAudioRef.current = {
+              audioDataUrl: msg.audioDataUrl,
+              disguised: msg.disguised,
+            };
+            soundEngine.playWalkieTalkieAudio(msg.audioDataUrl, msg.disguised, onMsgEnd);
+          } else if (msg.hasAudio && snapshot.code) {
+            fetch(`/api/games?code=${encodeURIComponent(snapshot.code)}&clipId=${encodeURIComponent(msg.id)}`)
+              .then((r) => r.json())
+              .then((data) => {
+                if (data?.clip?.audioDataUrl) {
+                  lastRadioAudioRef.current = {
+                    audioDataUrl: data.clip.audioDataUrl,
+                    disguised: msg.disguised,
+                  };
+                  soundEngine.playWalkieTalkieAudio(data.clip.audioDataUrl, msg.disguised, onMsgEnd);
+                }
+              })
+              .catch(() => {});
+          }
         }
       }
     }
@@ -1395,7 +1554,7 @@ function AuiManhuntApp() {
     }
     const band = snapshot.hunterProximity.distanceBand === 'CRITICAL' ? 'CRITICAL' : 'NEAR';
     soundEngine.playHeartbeatPulse(band);
-    const intervalMs = band === 'CRITICAL' ? 650 : 1250;
+    const intervalMs = band === 'CRITICAL' ? 950 : 2000;
     const hbTimer = setInterval(() => {
       if (document.visibilityState === 'visible') {
         soundEngine.playHeartbeatPulse(band);
@@ -1978,6 +2137,9 @@ function AuiManhuntApp() {
       seenEventIdsRef.current.clear();
       seededEventsGameIdRef.current = null;
       setRoomCode(data.code);
+      if (typeof window !== 'undefined') {
+        window.history.replaceState(null, '', `/?room=${encodeURIComponent(data.code)}`);
+      }
       setActivePlayerId(data.participantId);
       setKnownPlayerIds([data.participantId]);
       setSnapshot(data.snapshot ? hydrateSnapshotWithMediaCache(data.snapshot, data.participantId) : null);
@@ -2040,6 +2202,9 @@ function AuiManhuntApp() {
       seenEventIdsRef.current.clear();
       seededEventsGameIdRef.current = null;
       setRoomCode(data.code);
+      if (typeof window !== 'undefined') {
+        window.history.replaceState(null, '', `/?room=${encodeURIComponent(data.code)}`);
+      }
       setActivePlayerId(data.participantId);
       setKnownPlayerIds([data.participantId]);
       setSnapshot(data.snapshot ? hydrateSnapshotWithMediaCache(data.snapshot, data.participantId) : null);
@@ -2086,12 +2251,16 @@ function AuiManhuntApp() {
             ),
           };
         }
+        case 'UPDATE_LOBBY_SETTINGS':
         case 'UPDATE_RULES': {
           const nextSettings = { ...prev.settings };
           if (payload.hunterCount !== undefined) nextSettings.hunterCount = Number(payload.hunterCount);
           if (payload.durationMinutes !== undefined) nextSettings.durationMinutes = Number(payload.durationMinutes);
           if (payload.countdownSeconds !== undefined) nextSettings.countdownSeconds = Number(payload.countdownSeconds);
           if (payload.gpsIntervalSeconds !== undefined) nextSettings.gpsIntervalSeconds = Number(payload.gpsIntervalSeconds);
+          if (payload.soundUses !== undefined) nextSettings.soundUsesPerHunter = Number(payload.soundUses);
+          if (payload.soundUsesPerHunter !== undefined) nextSettings.soundUsesPerHunter = Number(payload.soundUsesPerHunter);
+          if (payload.soundCooldownSeconds !== undefined) nextSettings.soundCooldownSeconds = Number(payload.soundCooldownSeconds);
           if (payload.ghostCloakUsesPerHider !== undefined) nextSettings.ghostCloakUsesPerHider = Number(payload.ghostCloakUsesPerHider);
           if (payload.walkieTalkieEnabled !== undefined) nextSettings.walkieTalkieEnabled = Boolean(payload.walkieTalkieEnabled);
           if (payload.hunterVisibilityMode !== undefined) nextSettings.hunterVisibilityMode = payload.hunterVisibilityMode as HunterVisibilityMode;
@@ -2467,29 +2636,141 @@ function AuiManhuntApp() {
   }
 
   const handleReplayLastRadioMessage = useCallback(async () => {
-    if (!snapshot?.latestVoiceClip) {
+    if (!snapshot?.latestVoiceClip && !lastRadioAudioRef.current) {
       showToast('No radio messages received yet in this match.', 'info');
       return;
     }
-    const clip = snapshot.latestVoiceClip;
     setSoundUnlockedLocal(true);
-    const roleLabel = clip.senderRole || 'PLAYER';
+    const clip = snapshot?.latestVoiceClip;
+    const roleLabel = clip?.senderRole || 'PLAYER';
     setActiveWalkieSpeaker({
-      nickname: clip.senderNickname,
+      nickname: clip?.senderNickname || 'Player',
       role: roleLabel,
-      disguised: clip.disguised,
+      disguised: clip?.disguised || lastRadioAudioRef.current?.disguised || false,
+      voiceText: clip?.voiceText,
     });
     const onEnd = () => {
       setActiveWalkieSpeaker((prev) =>
-        prev && prev.nickname === clip.senderNickname ? null : prev
+        prev && prev.nickname === (clip?.senderNickname || 'Player') ? null : prev
       );
     };
-    if (clip.audioDataUrl) {
-      await soundEngine.playWalkieTalkieAudio(clip.audioDataUrl, clip.disguised, onEnd);
-    } else if (clip.voiceText) {
-      await soundEngine.playSilentRadioTTS(clip.voiceText, clip.disguised, onEnd);
+
+    if (lastRadioAudioRef.current?.audioDataUrl) {
+      await soundEngine.playWalkieTalkieAudio(
+        lastRadioAudioRef.current.audioDataUrl,
+        lastRadioAudioRef.current.disguised,
+        onEnd
+      );
+      showToast('Replaying last radio transmission 📻');
+      return;
     }
-  }, [snapshot?.latestVoiceClip, showToast]);
+
+    if (clip?.audioDataUrl) {
+      lastRadioAudioRef.current = { audioDataUrl: clip.audioDataUrl, disguised: clip.disguised };
+      await soundEngine.playWalkieTalkieAudio(clip.audioDataUrl, clip.disguised, onEnd);
+      showToast('Replaying last radio transmission 📻');
+    } else if (clip?.hasAudio && snapshot?.code) {
+      try {
+        const res = await fetch(`/api/games?code=${encodeURIComponent(snapshot.code)}&clipId=${encodeURIComponent(clip.id)}`);
+        const data = await res.json();
+        if (data?.clip?.audioDataUrl) {
+          lastRadioAudioRef.current = { audioDataUrl: data.clip.audioDataUrl, disguised: clip.disguised };
+          await soundEngine.playWalkieTalkieAudio(data.clip.audioDataUrl, clip.disguised, onEnd);
+          showToast('Replaying last radio transmission 📻');
+          return;
+        }
+      } catch {}
+      if (clip.voiceText) {
+        await soundEngine.playSilentRadioTTS(clip.voiceText, clip.disguised, onEnd);
+        showToast('Replaying last radio transmission 📻');
+      }
+    } else if (clip?.voiceText) {
+      await soundEngine.playSilentRadioTTS(clip.voiceText, clip.disguised, onEnd);
+      showToast('Replaying last radio transmission 📻');
+    }
+  }, [snapshot?.latestVoiceClip, snapshot?.code, showToast]);
+
+  const handleUpdateLobbySetting = useCallback(
+    <K extends keyof LocalLobbySettings>(key: K, value: LocalLobbySettings[K]) => {
+      if (!snapshot) return;
+
+      const currentBase: LocalLobbySettings = localLobbySettingsRef.current || {
+        hunterCount: snapshot.settings.hunterCount,
+        durationMinutes: snapshot.settings.durationMinutes,
+        countdownSeconds: snapshot.settings.countdownSeconds,
+        gpsIntervalSeconds: snapshot.settings.gpsIntervalSeconds,
+        soundUsesPerHunter: snapshot.settings.soundUsesPerHunter,
+        soundCooldownSeconds: snapshot.settings.soundCooldownSeconds,
+        photoRequestsPerHider: snapshot.settings.photoRequestsPerHider ?? 1,
+        ghostCloakUsesPerHider: snapshot.settings.ghostCloakUsesPerHider ?? 1,
+        walkieTalkieEnabled: snapshot.settings.walkieTalkieEnabled !== false,
+        hunterVisibilityMode: snapshot.settings.hunterVisibilityMode || 'ALWAYS_LIVE',
+        catchVerificationMode: snapshot.settings.catchVerificationMode || 'PROXIMITY_20M',
+        outOfBoundsGraceSeconds: snapshot.settings.outOfBoundsGraceSeconds || 60,
+        teammateVisibility: snapshot.settings.teammateVisibility || 'SHOW_TEAMMATES',
+        shrinkingZone: Boolean(snapshot.settings.shrinkingZone),
+      };
+
+      const next: LocalLobbySettings = { ...currentBase, [key]: value };
+      setLocalLobbySettings(next);
+      localLobbySettingsRef.current = next;
+
+      // Optimistic update of local snapshot
+      setSnapshot((prev) => (prev ? { ...prev, settings: { ...prev.settings, [key]: value } } : prev));
+
+      // Lock server state from overwriting host selections for 5000ms
+      settingsMutationLockUntilRef.current = Date.now() + 5000;
+      if (pollAbortControllerRef.current) {
+        pollAbortControllerRef.current.abort();
+        pollAbortControllerRef.current = null;
+      }
+
+      if (saveStatusTimerRef.current) clearTimeout(saveStatusTimerRef.current);
+      setLobbySettingsSaveStatus('saving');
+
+      if (settingsDebounceTimerRef.current) {
+        clearTimeout(settingsDebounceTimerRef.current);
+      }
+      settingsDebounceTimerRef.current = setTimeout(async () => {
+        const { roomCode: code, activePlayerId: pid } = latestStateRef.current;
+        if (!code || !pid) return;
+        const s = localLobbySettingsRef.current;
+        if (!s) return;
+
+        try {
+          await fetch(`/api/games?code=${encodeURIComponent(code)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'UPDATE_LOBBY_SETTINGS',
+              participantId: pid,
+              hunterCount: s.hunterCount,
+              durationMinutes: s.durationMinutes,
+              countdownSeconds: s.countdownSeconds,
+              gpsIntervalSeconds: s.gpsIntervalSeconds,
+              soundUses: s.soundUsesPerHunter,
+              soundCooldownSeconds: s.soundCooldownSeconds,
+              photoRequestsPerHider: s.photoRequestsPerHider,
+              ghostCloakUsesPerHider: s.ghostCloakUsesPerHider,
+              walkieTalkieEnabled: s.walkieTalkieEnabled,
+              hunterVisibilityMode: s.hunterVisibilityMode,
+              catchVerificationMode: s.catchVerificationMode,
+              outOfBoundsGraceSeconds: s.outOfBoundsGraceSeconds,
+              teammateVisibility: s.teammateVisibility,
+              shrinkingZone: s.shrinkingZone,
+            }),
+          });
+          setLobbySettingsSaveStatus('saved');
+          saveStatusTimerRef.current = setTimeout(() => {
+            setLobbySettingsSaveStatus('idle');
+          }, 2000);
+        } catch {
+          setLobbySettingsSaveStatus('idle');
+        }
+      }, 350);
+    },
+    [snapshot]
+  );
 
   async function handleSendTaunt(tauntType: TauntType) {
     if ((snapshot?.tauntCooldownSecondsLeft || 0) > 0) {
@@ -2548,6 +2829,9 @@ function AuiManhuntApp() {
     setSnapshot(null);
     setKnownPlayerIds([]);
     setScreen('HOME');
+    if (typeof window !== 'undefined') {
+      window.history.replaceState(null, '', '/');
+    }
     showToast('Left game and stopped sharing GPS.');
   }
 
@@ -2703,7 +2987,7 @@ function AuiManhuntApp() {
 
   const mapMarkers: MapParticipantMarker[] = useMemo(() => {
     if (!snapshot || isHunterMapLocked) return [];
-    return snapshot.participants
+    const rawList = snapshot.participants
       .filter((p) => p.location !== null && (p.id === activePlayerId || snapshot.state !== 'COUNTDOWN'))
       .map((p) => ({
         id: p.id,
@@ -2716,6 +3000,44 @@ function AuiManhuntApp() {
         ageSeconds: p.location!.ageSeconds,
         isStale: p.location!.isStale,
       }));
+
+    // Detect overlapping coordinates and apply ~3.5m radial offset so pins never obscure each other
+    const clusters: Array<typeof rawList> = [];
+    rawList.forEach((marker) => {
+      let cluster = clusters.find((c) =>
+        c.some((m) => Math.hypot(m.lat - marker.lat, m.lng - marker.lng) < 0.00005)
+      );
+      if (!cluster) {
+        cluster = [];
+        clusters.push(cluster);
+      }
+      cluster.push(marker);
+    });
+
+    const adjusted: MapParticipantMarker[] = [];
+    clusters.forEach((cluster) => {
+      if (cluster.length === 1) {
+        adjusted.push(cluster[0]);
+      } else {
+        const count = cluster.length;
+        cluster.forEach((m, idx) => {
+          if (idx === 0) {
+            adjusted.push(m);
+          } else {
+            const angle = (idx * 2 * Math.PI) / count;
+            const dLat = (Math.sin(angle) * 3.5) / 111320;
+            const dLng = (Math.cos(angle) * 3.5) / (111320 * Math.cos((m.lat * Math.PI) / 180));
+            adjusted.push({
+              ...m,
+              lat: m.lat + dLat,
+              lng: m.lng + dLng,
+            });
+          }
+        });
+      }
+    });
+
+    return adjusted;
   }, [snapshot?.participants, snapshot?.state, isHunterMapLocked, activePlayerId]);
 
   const gameplayBoundary = useMemo(
@@ -2815,19 +3137,20 @@ function AuiManhuntApp() {
         }
         if (closestHunter) {
           const dist = Math.round(minDistance);
+          const showRawMeters = snapshot.settings.hunterVisibilityMode === 'ALWAYS_LIVE';
           if (dist <= 20) {
             return {
-              label: `🚨 Hunter nearby: ${dist}m!`,
+              label: showRawMeters ? `🚨 Hunter nearby: ${dist}m!` : '🚨 Hunter: Danger Close!',
               tone: 'critical' as const,
             };
           } else if (dist <= 40) {
             return {
-              label: `⚠️ Hunter: ${dist}m`,
+              label: showRawMeters ? `⚠️ Hunter: ${dist}m` : '⚠️ Hunter: Approaching Area',
               tone: 'warning' as const,
             };
           }
           return {
-            label: `🧭 Hunter: ${dist}m`,
+            label: showRawMeters ? `🧭 Hunter: ${dist}m` : '🛡️ Radar: Area Clear',
             tone: 'safe' as const,
           };
         }
@@ -3666,291 +3989,230 @@ function AuiManhuntApp() {
                 </div>
               </div>
 
-              {isHost && (
-                <div className="mt-4 pt-4 border-t border-stoneline">
-                  <div className="flex items-center justify-between mb-2.5">
-                    <span className="text-xs font-bold text-cedar uppercase tracking-wider">Host Lobby Settings (Edit Live)</span>
-                    <span className="text-[11px] text-ink-muted">Adjust rules without leaving the room</span>
+              {isHost && (() => {
+                const currentLobbySettings: LocalLobbySettings = localLobbySettings || {
+                  hunterCount: snapshot.settings.hunterCount,
+                  durationMinutes: snapshot.settings.durationMinutes,
+                  countdownSeconds: snapshot.settings.countdownSeconds,
+                  gpsIntervalSeconds: snapshot.settings.gpsIntervalSeconds,
+                  soundUsesPerHunter: snapshot.settings.soundUsesPerHunter,
+                  soundCooldownSeconds: snapshot.settings.soundCooldownSeconds,
+                  photoRequestsPerHider: snapshot.settings.photoRequestsPerHider ?? 1,
+                  ghostCloakUsesPerHider: snapshot.settings.ghostCloakUsesPerHider ?? 1,
+                  walkieTalkieEnabled: snapshot.settings.walkieTalkieEnabled !== false,
+                  hunterVisibilityMode: snapshot.settings.hunterVisibilityMode || 'ALWAYS_LIVE',
+                  catchVerificationMode: snapshot.settings.catchVerificationMode || 'PROXIMITY_20M',
+                  outOfBoundsGraceSeconds: snapshot.settings.outOfBoundsGraceSeconds || 60,
+                  teammateVisibility: snapshot.settings.teammateVisibility || 'SHOW_TEAMMATES',
+                  shrinkingZone: Boolean(snapshot.settings.shrinkingZone),
+                };
+
+                return (
+                  <div className="mt-4 pt-4 border-t border-stoneline">
+                    <button
+                      type="button"
+                      onClick={() => setHostSettingsOpen((prev) => !prev)}
+                      className="w-full flex items-center justify-between p-3 rounded-xl bg-canvas border border-stoneline hover:bg-canvas-subtle transition-colors text-left"
+                    >
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-xs font-bold text-cedar uppercase tracking-wider flex items-center gap-1.5">
+                          ⚙️ Host Settings (Live Rules)
+                        </span>
+                        {lobbySettingsSaveStatus === 'saving' && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-50 text-amber-800 border border-amber-200">
+                            <span className="animate-spin inline-block">⏳</span> Saving...
+                          </span>
+                        )}
+                        {lobbySettingsSaveStatus === 'saved' && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                            ✓ Saved
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5 text-xs text-ink-muted">
+                        <span>{hostSettingsOpen ? 'Hide Rules' : 'Customize 12 Rules'}</span>
+                        <span className="text-xs font-bold">{hostSettingsOpen ? '▲' : '▼'}</span>
+                      </div>
+                    </button>
+
+                    {hostSettingsOpen && (
+                      <div className="mt-3 p-3.5 rounded-xl bg-canvas-subtle border border-stoneline space-y-3">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5 text-xs">
+                      <div>
+                        <label className="block font-semibold text-ink-secondary mb-1">Number of Hunters</label>
+                        <select
+                          value={currentLobbySettings.hunterCount}
+                          onChange={(e) => handleUpdateLobbySetting('hunterCount', Number(e.target.value))}
+                          className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
+                        >
+                          <option value={1}>1 Hunter</option>
+                          <option value={2}>2 Hunters</option>
+                          <option value={3}>3 Hunters</option>
+                          <option value={4}>4 Hunters</option>
+                          <option value={5}>5 Hunters</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-ink-secondary mb-1">Round Duration</label>
+                        <select
+                          value={currentLobbySettings.durationMinutes}
+                          onChange={(e) => handleUpdateLobbySetting('durationMinutes', Number(e.target.value))}
+                          className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
+                        >
+                          <option value={5}>5 mins (Quick Test)</option>
+                          <option value={10}>10 mins</option>
+                          <option value={15}>15 mins</option>
+                          <option value={20}>20 mins</option>
+                          <option value={30}>30 mins</option>
+                          <option value={45}>45 mins</option>
+                          <option value={60}>60 mins</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-ink-secondary mb-1">Ghost Cloak Uses</label>
+                        <select
+                          value={currentLobbySettings.ghostCloakUsesPerHider}
+                          onChange={(e) => handleUpdateLobbySetting('ghostCloakUsesPerHider', Number(e.target.value))}
+                          className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
+                        >
+                          <option value={1}>1 use / Hider</option>
+                          <option value={2}>2 uses / Hider</option>
+                          <option value={3}>3 uses / Hider</option>
+                          <option value={0}>Disabled (0)</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-ink-secondary mb-1">Walkie-Talkie Radio</label>
+                        <select
+                          value={currentLobbySettings.walkieTalkieEnabled ? 'yes' : 'no'}
+                          onChange={(e) => handleUpdateLobbySetting('walkieTalkieEnabled', e.target.value === 'yes')}
+                          className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
+                        >
+                          <option value="yes">Enabled</option>
+                          <option value="no">Disabled</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-ink-secondary mb-1">Hunter Map Visibility</label>
+                        <select
+                          value={currentLobbySettings.hunterVisibilityMode}
+                          onChange={(e) => handleUpdateLobbySetting('hunterVisibilityMode', e.target.value as HunterVisibilityMode)}
+                          className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
+                        >
+                          <option value="ALWAYS_LIVE">Always Live on Map</option>
+                          <option value="RADAR_PING_15S">Radar Ping Mode</option>
+                          <option value="HIDDEN">Hidden from Hiders</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-ink-secondary mb-1">Hider Head-Start</label>
+                        <select
+                          value={currentLobbySettings.countdownSeconds}
+                          onChange={(e) => handleUpdateLobbySetting('countdownSeconds', Number(e.target.value))}
+                          className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
+                        >
+                          <option value={10}>10 sec</option>
+                          <option value={30}>30 sec</option>
+                          <option value={60}>60 sec</option>
+                          <option value={0}>No wait</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-ink-secondary mb-1">GPS Update Interval</label>
+                        <select
+                          value={currentLobbySettings.gpsIntervalSeconds}
+                          onChange={(e) => handleUpdateLobbySetting('gpsIntervalSeconds', Number(e.target.value))}
+                          className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
+                        >
+                          <option value={15}>15 sec</option>
+                          <option value={30}>30 sec</option>
+                          <option value={60}>60 sec</option>
+                          <option value={90}>90 sec</option>
+                          <option value={120}>2 mins</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-ink-secondary mb-1">Catch Verification</label>
+                        <select
+                          value={currentLobbySettings.catchVerificationMode}
+                          onChange={(e) => handleUpdateLobbySetting('catchVerificationMode', e.target.value as CatchVerificationMode)}
+                          className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
+                        >
+                          <option value="PROXIMITY_20M">Proximity &lt; 20m</option>
+                          <option value="CATCH_PIN">2-Digit Catch PIN</option>
+                          <option value="INSTANT_TAP">Instant Hunter Tap</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-ink-secondary mb-1">Out-of-Bounds Grace</label>
+                        <select
+                          value={currentLobbySettings.outOfBoundsGraceSeconds}
+                          onChange={(e) => handleUpdateLobbySetting('outOfBoundsGraceSeconds', Number(e.target.value))}
+                          className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
+                        >
+                          <option value={30}>30 sec</option>
+                          <option value={60}>60 sec</option>
+                          <option value={90}>90 sec</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-ink-secondary mb-1">Teammate Visibility</label>
+                        <select
+                          value={currentLobbySettings.teammateVisibility}
+                          onChange={(e) => handleUpdateLobbySetting('teammateVisibility', e.target.value as TeammateVisibilityMode)}
+                          className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
+                        >
+                          <option value="SHOW_TEAMMATES">Show Teammates</option>
+                          <option value="HIDE_TEAMMATES">Hide (Fog of War)</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-ink-secondary mb-1">Shrinking Play Zone</label>
+                        <select
+                          value={currentLobbySettings.shrinkingZone ? 'yes' : 'no'}
+                          onChange={(e) => handleUpdateLobbySetting('shrinkingZone', e.target.value === 'yes')}
+                          className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
+                        >
+                          <option value="no">Off (Static Circle)</option>
+                          <option value="yes">On (-15% / 5m in 2nd Half)</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block font-semibold text-ink-secondary mb-1">Photo Requests</label>
+                        <select
+                          value={currentLobbySettings.photoRequestsPerHider}
+                          onChange={(e) => handleUpdateLobbySetting('photoRequestsPerHider', Number(e.target.value))}
+                          className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
+                        >
+                          <option value={1}>1 per Hider</option>
+                          <option value={2}>2 per Hider</option>
+                          <option value={3}>3 per Hider</option>
+                          <option value={0}>Disabled (0)</option>
+                        </select>
+                      </div>
+                        </div>
+
+                        {hunterCountConflict && (
+                          <div className="mt-2.5 p-2.5 rounded-xl bg-amber-50 border border-amber-300 text-xs text-amber-900 font-medium">
+                            Hunter count ({snapshot.settings.hunterCount}) must be less than total players ({snapshot.participants.length}). Reduce Hunters above or wait for more players to join.
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
-                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 text-xs">
-                    <div>
-                      <label className="block font-semibold text-ink-secondary mb-1">Number of Hunters</label>
-                      <select
-                        value={snapshot.settings.hunterCount}
-                        onChange={(e) =>
-                          dispatchGameAction(
-                            {
-                              action: 'UPDATE_RULES',
-                              hunterCount: Number(e.target.value),
-                              durationMinutes: snapshot.settings.durationMinutes,
-                            },
-                            'Updated number of Hunters.'
-                          )
-                        }
-                        className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
-                      >
-                        <option value={1}>1 Hunter</option>
-                        <option value={2}>2 Hunters</option>
-                        <option value={3}>3 Hunters</option>
-                        <option value={4}>4 Hunters</option>
-                        <option value={5}>5 Hunters</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block font-semibold text-ink-secondary mb-1">Round Duration</label>
-                      <select
-                        value={snapshot.settings.durationMinutes}
-                        onChange={(e) =>
-                          dispatchGameAction(
-                            {
-                              action: 'UPDATE_RULES',
-                              hunterCount: snapshot.settings.hunterCount,
-                              durationMinutes: Number(e.target.value),
-                            },
-                            'Updated round duration.'
-                          )
-                        }
-                        className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
-                      >
-                        <option value={5}>5 mins (Quick Test)</option>
-                        <option value={10}>10 mins</option>
-                        <option value={15}>15 mins</option>
-                        <option value={20}>20 mins</option>
-                        <option value={30}>30 mins</option>
-                        <option value={45}>45 mins</option>
-                        <option value={60}>60 mins</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block font-semibold text-ink-secondary mb-1">Ghost Cloak Uses</label>
-                      <select
-                        value={snapshot.settings.ghostCloakUsesPerHider ?? 1}
-                        onChange={(e) =>
-                          dispatchGameAction(
-                            {
-                              action: 'UPDATE_RULES',
-                              hunterCount: snapshot.settings.hunterCount,
-                              durationMinutes: snapshot.settings.durationMinutes,
-                              ghostCloakUsesPerHider: Number(e.target.value),
-                            },
-                            'Updated Ghost Cloak uses per Hider.'
-                          )
-                        }
-                        className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
-                      >
-                        <option value={1}>1 use / Hider</option>
-                        <option value={2}>2 uses / Hider</option>
-                        <option value={3}>3 uses / Hider</option>
-                        <option value={0}>Disabled (0)</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block font-semibold text-ink-secondary mb-1">Walkie-Talkie Radio</label>
-                      <select
-                        value={snapshot.settings.walkieTalkieEnabled !== false ? 'yes' : 'no'}
-                        onChange={(e) =>
-                          dispatchGameAction(
-                            {
-                              action: 'UPDATE_RULES',
-                              hunterCount: snapshot.settings.hunterCount,
-                              durationMinutes: snapshot.settings.durationMinutes,
-                              walkieTalkieEnabled: e.target.value === 'yes',
-                            },
-                            e.target.value === 'yes' ? 'Walkie-Talkie radio enabled!' : 'Walkie-Talkie radio disabled.'
-                          )
-                        }
-                        className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
-                      >
-                        <option value="yes">Enabled</option>
-                        <option value="no">Disabled</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block font-semibold text-ink-secondary mb-1">Hunter Map Visibility</label>
-                      <select
-                        value={snapshot.settings.hunterVisibilityMode || 'ALWAYS_LIVE'}
-                        onChange={(e) =>
-                          dispatchGameAction(
-                            {
-                              action: 'UPDATE_RULES',
-                              hunterCount: snapshot.settings.hunterCount,
-                              durationMinutes: snapshot.settings.durationMinutes,
-                              hunterVisibilityMode: e.target.value,
-                            },
-                            'Updated Hunter map visibility.'
-                          )
-                        }
-                        className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
-                      >
-                        <option value="ALWAYS_LIVE">Always Live on Map</option>
-                        <option value="RADAR_PING_15S">Radar Ping Mode</option>
-                        <option value="HIDDEN">Hidden from Hiders</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block font-semibold text-ink-secondary mb-1">Hider Head-Start</label>
-                      <select
-                        value={snapshot.settings.countdownSeconds}
-                        onChange={(e) =>
-                          dispatchGameAction(
-                            {
-                              action: 'UPDATE_RULES',
-                              hunterCount: snapshot.settings.hunterCount,
-                              durationMinutes: snapshot.settings.durationMinutes,
-                              countdownSeconds: Number(e.target.value),
-                            },
-                            'Updated hiding countdown.'
-                          )
-                        }
-                        className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
-                      >
-                        <option value={10}>10 sec</option>
-                        <option value={30}>30 sec</option>
-                        <option value={60}>60 sec</option>
-                        <option value={0}>No wait</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block font-semibold text-ink-secondary mb-1">GPS Update Interval</label>
-                      <select
-                        value={snapshot.settings.gpsIntervalSeconds || 60}
-                        onChange={(e) =>
-                          dispatchGameAction(
-                            {
-                              action: 'UPDATE_RULES',
-                              hunterCount: snapshot.settings.hunterCount,
-                              durationMinutes: snapshot.settings.durationMinutes,
-                              gpsIntervalSeconds: Number(e.target.value),
-                            },
-                            `GPS update interval set to ${e.target.value}s.`
-                          )
-                        }
-                        className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
-                      >
-                        <option value={15}>15 sec</option>
-                        <option value={30}>30 sec</option>
-                        <option value={60}>60 sec</option>
-                        <option value={90}>90 sec</option>
-                        <option value={120}>2 mins</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block font-semibold text-ink-secondary mb-1">Catch Verification</label>
-                      <select
-                        value={snapshot.settings.catchVerificationMode || 'PROXIMITY_20M'}
-                        onChange={(e) =>
-                          dispatchGameAction(
-                            {
-                              action: 'UPDATE_RULES',
-                              hunterCount: snapshot.settings.hunterCount,
-                              durationMinutes: snapshot.settings.durationMinutes,
-                              catchVerificationMode: e.target.value,
-                            },
-                            'Updated catch verification mode.'
-                          )
-                        }
-                        className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
-                      >
-                        <option value="PROXIMITY_20M">Proximity &lt; 20m</option>
-                        <option value="CATCH_PIN">2-Digit Catch PIN</option>
-                        <option value="INSTANT_TAP">Instant Hunter Tap</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block font-semibold text-ink-secondary mb-1">Out-of-Bounds Grace</label>
-                      <select
-                        value={snapshot.settings.outOfBoundsGraceSeconds || 60}
-                        onChange={(e) =>
-                          dispatchGameAction(
-                            {
-                              action: 'UPDATE_RULES',
-                              hunterCount: snapshot.settings.hunterCount,
-                              durationMinutes: snapshot.settings.durationMinutes,
-                              outOfBoundsGraceSeconds: Number(e.target.value),
-                            },
-                            `Out-of-bounds grace period set to ${e.target.value}s.`
-                          )
-                        }
-                        className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
-                      >
-                        <option value={30}>30 sec</option>
-                        <option value={60}>60 sec</option>
-                        <option value={90}>90 sec</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block font-semibold text-ink-secondary mb-1">Teammate Visibility</label>
-                      <select
-                        value={snapshot.settings.teammateVisibility || 'SHOW_TEAMMATES'}
-                        onChange={(e) =>
-                          dispatchGameAction(
-                            {
-                              action: 'UPDATE_RULES',
-                              hunterCount: snapshot.settings.hunterCount,
-                              durationMinutes: snapshot.settings.durationMinutes,
-                              teammateVisibility: e.target.value,
-                            },
-                            'Updated Hider teammate visibility.'
-                          )
-                        }
-                        className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
-                      >
-                        <option value="SHOW_TEAMMATES">Show Teammates</option>
-                        <option value="HIDE_TEAMMATES">Hide (Fog of War)</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block font-semibold text-ink-secondary mb-1">Shrinking Play Zone</label>
-                      <select
-                        value={snapshot.settings.shrinkingZone ? 'yes' : 'no'}
-                        onChange={(e) =>
-                          dispatchGameAction(
-                            {
-                              action: 'UPDATE_RULES',
-                              hunterCount: snapshot.settings.hunterCount,
-                              durationMinutes: snapshot.settings.durationMinutes,
-                              shrinkingZone: e.target.value === 'yes',
-                            },
-                            e.target.value === 'yes' ? 'Shrinking Play Zone enabled!' : 'Shrinking Play Zone disabled.'
-                          )
-                        }
-                        className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
-                      >
-                        <option value="no">Off (Static Circle)</option>
-                        <option value="yes">On (-15% / 5m in 2nd Half)</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block font-semibold text-ink-secondary mb-1">Photo Requests</label>
-                      <select
-                        value={snapshot.settings.photoRequestsPerHider ?? 1}
-                        onChange={(e) =>
-                          dispatchGameAction(
-                            {
-                              action: 'UPDATE_RULES',
-                              hunterCount: snapshot.settings.hunterCount,
-                              durationMinutes: snapshot.settings.durationMinutes,
-                              photoRequestsPerHider: Number(e.target.value),
-                            },
-                            'Updated photo request limit.'
-                          )
-                        }
-                        className="w-full h-11 px-2.5 rounded-lg bg-canvas border border-stoneline font-semibold text-ink"
-                      >
-                        <option value={1}>1 per Hider</option>
-                        <option value={2}>2 per Hider</option>
-                        <option value={3}>3 per Hider</option>
-                        <option value={0}>Disabled (0)</option>
-                      </select>
-                    </div>
-                  </div>
-                  {hunterCountConflict && (
-                    <div className="mt-2.5 p-2.5 rounded-xl bg-amber-50 border border-amber-300 text-xs text-amber-900 font-medium">
-                      Hunter count ({snapshot.settings.hunterCount}) must be less than total players ({snapshot.participants.length}). Reduce Hunters above or wait for more players to join.
-                    </div>
-                  )}
-                </div>
-              )}
+                );
+              })()}
             </div>
 
             <div className="aui-card p-5 flex-1 flex flex-col justify-between">
@@ -4050,97 +4312,6 @@ function AuiManhuntApp() {
                   </button>
                 </div>
               </div>
-            </div>
-
-            {/* Live Notes & Activity Feed in Lobby */}
-            <div className="aui-card p-4 sm:p-5 space-y-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <h3 className="font-display font-bold text-sm text-ink">
-                    📋 Live Notes &amp; Activity Feed
-                  </h3>
-                  <p className="text-[11px] text-ink-muted">
-                    Send live notes &amp; sound alerts to everyone in the room
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap gap-1.5">
-                {QUICK_NOTE_PRESETS.map((preset) => (
-                  <button
-                    key={preset}
-                    type="button"
-                    disabled={pendingActionKey === 'SEND_NOTE'}
-                    onClick={() => handleSendNote(preset)}
-                    className="min-h-[36px] px-2.5 py-1 rounded-xl bg-canvas hover:bg-subtle border border-stoneline text-[11px] font-semibold text-ink transition disabled:opacity-50"
-                  >
-                    {preset}
-                  </button>
-                ))}
-              </div>
-
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  handleSendNote();
-                }}
-                className="flex items-center gap-2"
-              >
-                <input
-                  type="text"
-                  maxLength={140}
-                  value={noteInput}
-                  onChange={(e) => setNoteInput(e.target.value)}
-                  placeholder="Write a live note or alert to all players..."
-                  className="flex-1 h-11 px-3.5 rounded-xl bg-canvas border border-stoneline text-xs font-medium text-ink focus:outline-none focus:border-cedar"
-                />
-                <button
-                  type="submit"
-                  disabled={!noteInput.trim() || pendingActionKey === 'SEND_NOTE'}
-                  className="btn-cedar h-11 px-4 rounded-xl text-xs font-bold shrink-0 disabled:opacity-45"
-                >
-                  {pendingActionKey === 'SEND_NOTE' ? '⏳...' : '🔔 Send Note'}
-                </button>
-              </form>
-
-              {snapshot.events && snapshot.events.length > 0 && (
-                <div className="max-h-44 overflow-y-auto space-y-1.5 pr-1 pt-1 border-t border-stoneline">
-                  {[...snapshot.events]
-                    .slice()
-                    .reverse()
-                    .map((evt) => (
-                      <div
-                        key={evt.id}
-                        className="p-2.5 rounded-xl bg-canvas border border-stoneline text-xs flex items-start justify-between gap-2"
-                      >
-                        <div className="space-y-0.5">
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            <strong className="font-bold text-ink">{evt.senderName}</strong>
-                            {evt.senderRole && (
-                              <span
-                                className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${
-                                  evt.senderRole === 'HUNTER'
-                                    ? 'bg-hunter-light text-hunter'
-                                    : 'bg-cedar-light text-cedar'
-                                }`}
-                              >
-                                {evt.senderRole}
-                              </span>
-                            )}
-                          </div>
-                          <p className="text-ink-secondary font-medium leading-snug">{evt.message}</p>
-                        </div>
-                        <span className="text-[10px] font-mono text-ink-muted shrink-0">
-                          {new Date(evt.createdAt).toLocaleTimeString([], {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                            second: '2-digit',
-                          })}
-                        </span>
-                      </div>
-                    ))}
-                </div>
-              )}
             </div>
           </section>
         )}
@@ -4267,16 +4438,25 @@ function AuiManhuntApp() {
                     <span className="text-2xl shrink-0">📻</span>
                     <div>
                       <strong className="font-display font-extrabold text-sm sm:text-base text-white block">
-                        [{activeWalkieSpeaker.nickname} - {activeWalkieSpeaker.role}] is speaking on Walkie-Talkie...
+                        [{activeWalkieSpeaker.nickname} - {activeWalkieSpeaker.role}]: {activeWalkieSpeaker.voiceText ? `"${activeWalkieSpeaker.voiceText}"` : 'is speaking on Walkie-Talkie...'}
                       </strong>
                       <span className="text-xs text-indigo-200 font-medium">
                         {activeWalkieSpeaker.disguised ? '🕵️ Voice Disguise Filter Active • Live Radio Channel' : 'Live Campus Radio Transmission'}
                       </span>
                     </div>
                   </div>
-                  <span className="px-2.5 py-1 rounded-full bg-indigo-600 text-white font-mono text-[11px] font-bold uppercase shrink-0">
-                    ON AIR
-                  </span>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={handleReplayLastRadioMessage}
+                      className="px-2.5 py-1 rounded-xl bg-indigo-800 hover:bg-indigo-700 text-white font-bold text-xs flex items-center gap-1 transition-all"
+                    >
+                      🔊 Replay Last Radio
+                    </button>
+                    <span className="px-2.5 py-1 rounded-full bg-indigo-600 text-white font-mono text-[11px] font-bold uppercase shrink-0">
+                      ON AIR
+                    </span>
+                  </div>
                 </div>
               )}
 
@@ -4289,11 +4469,13 @@ function AuiManhuntApp() {
                     <span className="text-2xl shrink-0">💓 ⚠️</span>
                     <div>
                       <strong className="font-display font-extrabold text-base sm:text-lg text-white block uppercase tracking-wide">
-                        Hunter Nearby! ({snapshot.hunterProximity.distanceBand === 'CRITICAL' ? 'Critical < 20m!' : 'Within 40m'})
+                        {snapshot.settings.hunterVisibilityMode === 'ALWAYS_LIVE'
+                          ? `Hunter Nearby! (${snapshot.hunterProximity.distanceBand === 'CRITICAL' ? '< 20m' : '< 40m'})`
+                          : `Hunter Nearby! (${snapshot.hunterProximity.distanceBand === 'CRITICAL' ? 'Danger: Critical' : 'Approaching Area'})`}
                       </strong>
                       <span className="text-xs sm:text-sm text-red-100 font-medium block mt-0.5">
                         {snapshot.hunterProximity.distanceBand === 'CRITICAL'
-                          ? 'A Hunter is dangerously close! Move away or activate your Ghost Cloak below!'
+                          ? 'A Hunter is dangerously close! Move away or activate your Ghost Cloak!'
                           : 'Proximity Heartbeat Radar detected a Hunter approaching your area.'}
                       </span>
                     </div>
@@ -4365,7 +4547,8 @@ function AuiManhuntApp() {
                 </div>
               )}
 
-              <div className="aui-card p-3 sm:px-4 flex flex-col gap-2.5">
+              {/* Sticky Status Bar */}
+              <div className="sticky top-14 z-30 aui-card p-2.5 sm:px-4 shadow-md bg-canvas/95 backdrop-blur-sm flex flex-col gap-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className={`px-3 py-1.5 rounded-xl font-display font-bold text-xs text-white ${isHunter ? 'bg-hunter' : 'bg-cedar'}`}>
@@ -4449,12 +4632,12 @@ function AuiManhuntApp() {
                   </div>
                 </div>
 
-                {/* Hider Special Abilities & 2-Digit Catch PIN Bar */}
+                {/* Hider Catch PIN & Active Ghost Cloak Badge */}
                 {!isHunter && me?.status === 'ACTIVE' && (
-                  <div className="pt-2 border-t border-stoneline flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <div className="pt-1.5 border-t border-stoneline flex flex-wrap items-center justify-between gap-2 text-xs">
                     <div className="flex flex-wrap items-center gap-2">
                       {catchMode === 'CATCH_PIN' && snapshot.viewerCatchPin && (
-                        <div className="px-3 py-1.5 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 flex items-center gap-2">
+                        <div className="px-3 py-1 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 flex items-center gap-2">
                           <span className="font-semibold">🔐 Your Catch PIN:</span>
                           <span className="font-mono font-extrabold text-base tracking-widest text-hunter">
                             {snapshot.viewerCatchPin}
@@ -4468,43 +4651,21 @@ function AuiManhuntApp() {
                       )}
                     </div>
 
-                    <div className="flex items-center gap-2 ml-auto">
-                      {(snapshot.settings.ghostCloakUsesPerHider ?? 1) <= 0 ? (
-                        <span className="px-3 py-1.5 rounded-xl bg-subtle border border-stoneline text-ink-muted font-semibold text-xs">
-                          👻 Ghost Cloak Disabled
-                        </span>
-                      ) : snapshot.viewerGhostCloak?.active ? (
-                        <span className="px-3.5 py-2 rounded-xl bg-purple-900 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm">
+                    {snapshot.viewerGhostCloak?.active && (
+                      <div className="ml-auto">
+                        <span className="px-3 py-1 rounded-xl bg-purple-900 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm animate-pulse">
                           <span>👻 Ghost Cloak Active ({snapshot.viewerGhostCloak.secondsLeft}s left)</span>
                         </span>
-                      ) : snapshot.viewerGhostCloak?.used ? (
-                        <span className="px-3 py-1.5 rounded-xl bg-subtle border border-stoneline text-ink-muted font-semibold text-xs">
-                          👻 Ghost Cloak Used (0/{snapshot.viewerGhostCloak.maxUses ?? (snapshot.settings.ghostCloakUsesPerHider ?? 1)})
-                        </span>
-                      ) : (
-                        <button
-                          type="button"
-                          disabled={snapshot.state !== 'ACTIVE'}
-                          onClick={() => {
-                            soundEngine.playGhostCloakTone();
-                            dispatchGameAction(
-                              { action: 'ACTIVATE_GHOST_CLOAK' },
-                              '👻 Ghost Cloak Activated! Your location is hidden from Hunters for 60 seconds.'
-                            );
-                          }}
-                          className="min-h-[40px] px-3.5 py-1.5 rounded-xl bg-purple-800 hover:bg-purple-900 text-white font-bold text-xs transition shadow-sm disabled:opacity-45 disabled:cursor-not-allowed"
-                        >
-                          👻 Activate Ghost Cloak (60s) ({snapshot.viewerGhostCloak?.remainingUses ?? (snapshot.settings.ghostCloakUsesPerHider ?? 1)} left)
-                        </button>
-                      )}
-                    </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
 
+              {/* Map Container */}
               <div
                 style={{ position: 'relative', zIndex: 1, isolation: 'isolate' }}
-                className="map-stack-container relative w-full h-[52dvh] min-h-[320px] max-h-[540px] rounded-2xl overflow-hidden border border-stoneline shadow-sm bg-[#EBF1EC]"
+                className="map-stack-container relative w-full h-[52vh] sm:h-[60vh] min-h-[340px] rounded-2xl overflow-hidden border border-stoneline shadow-sm bg-[#EBF1EC]"
               >
                 {isHunterMapLocked ? (
                   <HunterLockedMapCountdownOverlay
@@ -4588,209 +4749,179 @@ function AuiManhuntApp() {
 
               {/* Segmented Tools & Activities Card */}
               <div className="aui-card p-3.5 sm:p-4 space-y-3.5">
-                {/* 4 Clean Tabs */}
-                <div className="grid grid-cols-4 gap-1 p-1 rounded-2xl bg-canvas border border-stoneline">
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('radio')}
-                    className={`min-h-[44px] px-2 py-1.5 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 ${
-                      activeTab === 'radio'
-                        ? 'bg-cedar text-white shadow-sm'
-                        : 'text-ink-secondary hover:text-ink hover:bg-subtle'
-                    }`}
-                  >
-                    <span>📻</span>
-                    <span className="truncate">Radio</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setActiveTab('players');
-                      setFitBoundaryCmd(Date.now());
-                    }}
-                    className={`min-h-[44px] px-2 py-1.5 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 ${
-                      activeTab === 'players'
-                        ? 'bg-cedar text-white shadow-sm'
-                        : 'text-ink-secondary hover:text-ink hover:bg-subtle'
-                    }`}
-                  >
-                    <span>👥</span>
-                    <span className="truncate">Players ({snapshot.participants.length})</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('feed')}
-                    className={`min-h-[44px] px-2 py-1.5 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 ${
-                      activeTab === 'feed'
-                        ? 'bg-cedar text-white shadow-sm'
-                        : 'text-ink-secondary hover:text-ink hover:bg-subtle'
-                    }`}
-                  >
-                    <span>📋</span>
-                    <span className="truncate">Feed</span>
-                    {snapshot.events && snapshot.events.length > 0 && (
-                      <span className="hidden sm:inline px-1.5 py-0.2 rounded-full bg-white/20 text-[10px] font-mono">
-                        {snapshot.events.length}
-                      </span>
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('safety')}
-                    className={`min-h-[44px] px-2 py-1.5 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 ${
-                      activeTab === 'safety'
-                        ? 'bg-cedar text-white shadow-sm'
-                        : 'text-ink-secondary hover:text-ink hover:bg-subtle'
-                    }`}
-                  >
-                    <span>⚙️</span>
-                    <span className="truncate">Safety</span>
-                  </button>
-                </div>
+                {/* 3 Clean Bottom Tabs */}
+                {(() => {
+                  const isRadioEnabled = snapshot.settings.walkieTalkieEnabled !== false;
+                  const effectiveTab = !isRadioEnabled && activeTab === 'radio' ? 'players' : activeTab;
 
-                {/* TAB 1: RADIO & ABILITIES */}
-                {activeTab === 'radio' && (
-                  <div className="space-y-4">
-                    {/* Walkie-Talkie & Soundboard Section */}
-                    <div className="p-3.5 rounded-xl bg-canvas border border-stoneline space-y-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div>
-                          <h4 className="font-display font-bold text-xs sm:text-sm text-ink flex items-center gap-1.5">
-                            <span>📻</span> Campus Walkie-Talkie &amp; Quick Taunts
-                          </h4>
-                          <p className="text-[11px] text-ink-muted">
-                            Broadcast live voice clips or use Silent Radio Callouts if hiding in quiet campus zones
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {snapshot.settings.walkieTalkieEnabled !== false && (
-                            <button
-                              type="button"
-                              onClick={() => setWalkieDisguised((prev) => !prev)}
-                              className={`min-h-[36px] px-3 py-1 rounded-xl text-xs font-bold border transition flex items-center gap-1.5 ${
-                                walkieDisguised
-                                  ? 'bg-purple-900 text-white border-purple-700 shadow-sm'
-                                  : 'bg-white text-ink-secondary border-stoneline hover:bg-subtle'
-                              }`}
-                            >
-                              <span>🕵️ Voice Disguise: {walkieDisguised ? 'ON' : 'OFF'}</span>
-                            </button>
-                          )}
+                  return (
+                    <>
+                      <div className={`grid ${isRadioEnabled ? 'grid-cols-3' : 'grid-cols-2'} gap-1 p-1 rounded-2xl bg-canvas border border-stoneline`}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActiveTab('players');
+                            setFitBoundaryCmd(Date.now());
+                          }}
+                          className={`min-h-[44px] px-2 py-1.5 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 ${
+                            effectiveTab === 'players'
+                              ? 'bg-cedar text-white shadow-sm'
+                              : 'text-ink-secondary hover:text-ink hover:bg-subtle'
+                          }`}
+                        >
+                          <span>👥</span>
+                          <span className="truncate">Players ({snapshot.participants.length})</span>
+                        </button>
+
+                        {isRadioEnabled && (
                           <button
                             type="button"
-                            disabled={!snapshot.latestVoiceClip}
-                            onClick={handleReplayLastRadioMessage}
-                            className="btn-secondary min-h-[36px] px-3 py-1 rounded-xl text-xs font-bold flex items-center gap-1.5 disabled:opacity-40"
-                          >
-                            <span>🔊 Replay Last Message</span>
-                          </button>
-                        </div>
-                      </div>
-
-                      {snapshot.settings.walkieTalkieEnabled !== false && (
-                        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
-                          <button
-                            type="button"
-                            onPointerDown={(e) => {
-                              e.preventDefault();
-                              startWalkieTalkieRecording();
-                            }}
-                            onPointerUp={(e) => {
-                              e.preventDefault();
-                              if (walkieRecording) stopWalkieTalkieRecording();
-                            }}
-                            onPointerCancel={() => {
-                              if (walkieRecording) stopWalkieTalkieRecording();
-                            }}
-                            onClick={() => {
-                              if (walkieRecording) {
-                                stopWalkieTalkieRecording();
-                              }
-                            }}
-                            className={`min-h-[48px] px-5 py-3 rounded-2xl font-display font-extrabold text-xs sm:text-sm transition flex items-center justify-center gap-2 shadow-sm select-none ${
-                              walkieRecording
-                                ? 'bg-red-600 text-white animate-pulse ring-4 ring-red-300'
-                                : 'bg-indigo-900 hover:bg-indigo-950 text-white'
+                            onClick={() => setActiveTab('radio')}
+                            className={`min-h-[44px] px-2 py-1.5 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 ${
+                              effectiveTab === 'radio'
+                                ? 'bg-cedar text-white shadow-sm'
+                                : 'text-ink-secondary hover:text-ink hover:bg-subtle'
                             }`}
                           >
-                            <span>{walkieRecording ? '🔴 Recording Radio...' : '🎙️ Hold to Talk (Walkie-Talkie)'}</span>
-                            {walkieRecording && (
-                              <span className="px-2 py-0.5 rounded-full bg-white/20 font-mono text-xs">
-                                {walkieRecordingSeconds}s / 6s
-                              </span>
-                            )}
+                            <span>📻</span>
+                            <span className="truncate">Radio &amp; Tools</span>
                           </button>
+                        )}
 
-                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 flex-1">
-                            {TAUNT_OPTIONS.map((t) => {
-                              const cd = snapshot.tauntCooldownSecondsLeft || 0;
-                              return (
-                                <button
-                                  key={t.type}
-                                  type="button"
-                                  disabled={cd > 0}
-                                  onClick={() => handleSendTaunt(t.type)}
-                                  className="min-h-[44px] px-2.5 py-1.5 rounded-xl bg-white hover:bg-subtle border border-stoneline text-[11px] font-bold text-ink transition flex flex-col items-center justify-center text-center leading-tight disabled:opacity-45 disabled:cursor-not-allowed"
-                                >
-                                  <span>
-                                    {t.emoji} {t.label}
-                                  </span>
-                                  {cd > 0 && (
-                                    <span className="text-[10px] font-mono text-amber-800 mt-0.5">{cd}s cooldown</span>
-                                  )}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Silent Radio TTS Fallback Callouts */}
-                      <div className="pt-2 border-t border-stoneline/80 space-y-2">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-bold text-ink flex items-center gap-1.5">
-                            <span>🤫</span> Silent Radio Callouts (TTS)
-                          </span>
-                          <span className="text-[10px] text-ink-muted">Plays squelch + speech on all phones</span>
-                        </div>
-                        <div className="flex flex-wrap gap-1.5">
-                          {SILENT_RADIO_CALLOUTS.map((callout) => (
-                            <button
-                              key={callout}
-                              type="button"
-                              onClick={() => handleSendSilentRadioTTS(callout)}
-                              className="min-h-[34px] px-2.5 py-1 rounded-lg bg-white hover:bg-subtle border border-stoneline text-[11px] font-semibold text-ink transition"
-                            >
-                              {callout}
-                            </button>
-                          ))}
-                        </div>
-                        <div className="flex gap-2">
-                          <input
-                            type="text"
-                            maxLength={120}
-                            value={silentRadioInput}
-                            onChange={(e) => setSilentRadioInput(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') {
-                                e.preventDefault();
-                                handleSendSilentRadioTTS();
-                              }
-                            }}
-                            placeholder="Type a silent tactical radio callout..."
-                            className="flex-1 h-10 px-3 rounded-xl bg-white border border-stoneline text-xs font-medium text-ink focus:outline-none focus:border-cedar"
-                          />
-                          <button
-                            type="button"
-                            disabled={!silentRadioInput.trim()}
-                            onClick={() => handleSendSilentRadioTTS()}
-                            className="btn-cedar h-10 px-3.5 rounded-xl text-xs font-bold disabled:opacity-40"
-                          >
-                            Send Radio
-                          </button>
-                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setActiveTab('safety')}
+                          className={`min-h-[44px] px-2 py-1.5 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 ${
+                            effectiveTab === 'safety'
+                              ? 'bg-cedar text-white shadow-sm'
+                              : 'text-ink-secondary hover:text-ink hover:bg-subtle'
+                          }`}
+                        >
+                          <span>⚙️</span>
+                          <span className="truncate">Safety</span>
+                        </button>
                       </div>
-                    </div>
+
+                      {/* TAB 1: RADIO & TOOLS */}
+                      {effectiveTab === 'radio' && isRadioEnabled && (
+                        <div className="space-y-4">
+                          {/* Minimalist Radio Section */}
+                          <div className="p-3.5 rounded-xl bg-canvas border border-stoneline space-y-3">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div>
+                                <h4 className="font-display font-bold text-xs sm:text-sm text-ink flex items-center gap-1.5">
+                                  <span>📻</span> Campus Radio &amp; Walkie-Talkie
+                                </h4>
+                                <p className="text-[11px] text-ink-muted">
+                                  Hold to speak or tap a role callout to broadcast across all phones
+                                </p>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => setWalkieDisguised((prev) => !prev)}
+                                  className={`min-h-[36px] px-3 py-1 rounded-xl text-xs font-bold border transition flex items-center gap-1.5 ${
+                                    walkieDisguised
+                                      ? 'bg-purple-900 text-white border-purple-700 shadow-sm'
+                                      : 'bg-white text-ink-secondary border-stoneline hover:bg-subtle'
+                                  }`}
+                                >
+                                  <span>🕵️ Voice Disguise: {walkieDisguised ? 'ON' : 'OFF'}</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={!snapshot.latestVoiceClip && !lastRadioAudioRef.current}
+                                  onClick={handleReplayLastRadioMessage}
+                                  className="btn-secondary min-h-[36px] px-3 py-1 rounded-xl text-xs font-bold flex items-center gap-1.5 disabled:opacity-40"
+                                >
+                                  <span>🔊 Replay Last Radio</span>
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Primary Hold to Talk Button */}
+                            <div>
+                              <button
+                                type="button"
+                                onPointerDown={(e) => {
+                                  e.preventDefault();
+                                  startWalkieTalkieRecording();
+                                }}
+                                onPointerUp={(e) => {
+                                  e.preventDefault();
+                                  if (walkieRecording) stopWalkieTalkieRecording();
+                                }}
+                                onPointerCancel={() => {
+                                  if (walkieRecording) stopWalkieTalkieRecording();
+                                }}
+                                onClick={() => {
+                                  if (walkieRecording) {
+                                    stopWalkieTalkieRecording();
+                                  }
+                                }}
+                                className={`w-full min-h-[50px] px-5 py-3 rounded-2xl font-display font-extrabold text-sm sm:text-base transition flex items-center justify-center gap-2 shadow-sm select-none ${
+                                  walkieRecording
+                                    ? 'bg-red-600 text-white animate-pulse ring-4 ring-red-300'
+                                    : 'bg-indigo-900 hover:bg-indigo-950 text-white active:scale-[0.99]'
+                                }`}
+                              >
+                                <span>{walkieRecording ? '🔴 Transmitting Voice Radio...' : '🎙️ Hold to Talk (Walkie-Talkie)'}</span>
+                                {walkieRecording && (
+                                  <span className="px-2 py-0.5 rounded-full bg-white/20 font-mono text-xs">
+                                    {walkieRecordingSeconds}s / 6s
+                                  </span>
+                                )}
+                              </button>
+                            </div>
+
+                            {/* 4 Role-Tailored Callout Chips */}
+                            <div className="pt-2 border-t border-stoneline/80 space-y-2">
+                              <div className="flex items-center justify-between">
+                                <span className="text-xs font-bold text-ink flex items-center gap-1.5">
+                                  <span>⚡</span> Tactical Callouts ({isHunter ? 'Hunter Team' : 'Hider Team'})
+                                </span>
+                                <span className="text-[10px] text-ink-muted">Instant TTS broadcast</span>
+                              </div>
+                              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                                {(isHunter ? HUNTER_CALLOUT_CHIPS : HIDER_CALLOUT_CHIPS).map((callout) => (
+                                  <button
+                                    key={callout}
+                                    type="button"
+                                    onClick={() => handleSendSilentRadioTTS(callout)}
+                                    className="min-h-[40px] px-2.5 py-1.5 rounded-xl bg-white hover:bg-subtle border border-stoneline text-[11px] font-bold text-ink transition active:scale-95 text-center flex items-center justify-center shadow-xs"
+                                  >
+                                    <span>{callout}</span>
+                                  </button>
+                                ))}
+                              </div>
+
+                              {/* Single Integrated TTS Input */}
+                              <div className="flex gap-2 pt-1">
+                                <input
+                                  type="text"
+                                  maxLength={120}
+                                  value={silentRadioInput}
+                                  onChange={(e) => setSilentRadioInput(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      e.preventDefault();
+                                      handleSendSilentRadioTTS(silentRadioInput);
+                                    }
+                                  }}
+                                  placeholder="Type silent radio message..."
+                                  className="flex-1 h-11 px-3.5 rounded-xl bg-white border border-stoneline text-xs font-semibold text-ink placeholder:text-ink-muted focus:outline-none focus:ring-2 focus:ring-cedar"
+                                />
+                                <button
+                                  type="button"
+                                  disabled={!silentRadioInput.trim()}
+                                  onClick={() => handleSendSilentRadioTTS(silentRadioInput)}
+                                  className="btn-cedar h-11 px-4 rounded-xl text-xs font-bold shrink-0 disabled:opacity-40"
+                                >
+                                  Transmit 📻
+                                </button>
+                              </div>
+                            </div>
+                          </div>
 
                     {/* Tactical Abilities Sub-Section */}
                     {!isHunter ? (
@@ -4917,11 +5048,29 @@ function AuiManhuntApp() {
                                         onClick={async () => {
                                           if (pr.photoDataUrl) {
                                             setViewerPhotoModal({ nickname: h.nickname, url: pr.photoDataUrl });
-                                          } else if (roomCode && activePlayerId) {
-                                            await fetchGameState(roomCode, activePlayerId, true);
-                                            const cached = photoCacheRef.current.get(pr.id);
-                                            if (cached) {
-                                              setViewerPhotoModal({ nickname: h.nickname, url: cached });
+                                            return;
+                                          }
+                                          const cached = photoCacheRef.current.get(pr.id);
+                                          if (cached) {
+                                            setViewerPhotoModal({ nickname: h.nickname, url: cached });
+                                            return;
+                                          }
+                                          if (roomCode) {
+                                            try {
+                                              const res = await fetch(`/api/games?code=${encodeURIComponent(roomCode)}&photoRequestId=${encodeURIComponent(pr.id)}`);
+                                              if (res.ok) {
+                                                const d = await res.json();
+                                                if (d?.photoDataUrl) {
+                                                  photoCacheRef.current.set(pr.id, d.photoDataUrl);
+                                                  setViewerPhotoModal({ nickname: h.nickname, url: d.photoDataUrl });
+                                                  return;
+                                                }
+                                              }
+                                            } catch {}
+                                            if (activePlayerId) {
+                                              await fetchGameState(roomCode, activePlayerId, true);
+                                              const c2 = photoCacheRef.current.get(pr.id);
+                                              if (c2) setViewerPhotoModal({ nickname: h.nickname, url: c2 });
                                             }
                                           }
                                         }}
@@ -4961,12 +5110,198 @@ function AuiManhuntApp() {
                         </div>
                       </div>
                     )}
+
+                    {/* Integrated Live Notes & Match Activity Log */}
+                    <div className="p-3.5 rounded-xl bg-canvas border border-stoneline space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-base">📋</span>
+                          <div>
+                            <h4 className="font-display font-bold text-xs sm:text-sm text-ink">
+                              Live Notes &amp; Activity Log
+                            </h4>
+                            <p className="text-[11px] text-ink-muted">
+                              Broadcast instant text alerts to all players (chime + banner)
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap gap-1.5">
+                        {QUICK_NOTE_PRESETS.map((preset) => (
+                          <button
+                            key={preset}
+                            type="button"
+                            disabled={pendingActionKey === 'SEND_NOTE'}
+                            onClick={() => handleSendNote(preset)}
+                            className="min-h-[36px] px-2.5 py-1 rounded-xl bg-white hover:bg-subtle border border-stoneline text-[11px] font-semibold text-ink transition disabled:opacity-50"
+                          >
+                            {preset}
+                          </button>
+                        ))}
+                      </div>
+
+                      <form
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          handleSendNote();
+                        }}
+                        className="flex items-center gap-2"
+                      >
+                        <input
+                          type="text"
+                          maxLength={140}
+                          value={noteInput}
+                          onChange={(e) => setNoteInput(e.target.value)}
+                          placeholder="Write a live note or alert to all players..."
+                          className="flex-1 h-11 px-3.5 rounded-xl bg-white border border-stoneline text-xs font-semibold text-ink placeholder:text-ink-muted focus:outline-none focus:ring-2 focus:ring-cedar"
+                        />
+                        <button
+                          type="submit"
+                          disabled={!noteInput.trim() || pendingActionKey === 'SEND_NOTE'}
+                          className="btn-cedar h-11 px-4 rounded-xl text-xs font-bold shrink-0 disabled:opacity-45"
+                        >
+                          {pendingActionKey === 'SEND_NOTE' ? '⏳...' : '🔔 Send Note'}
+                        </button>
+                      </form>
+
+                      {snapshot.events && snapshot.events.length > 0 && (
+                        <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1 pt-1.5 border-t border-stoneline">
+                          {[...snapshot.events]
+                            .slice()
+                            .reverse()
+                            .map((evt) => (
+                              <div
+                                key={evt.id}
+                                className="p-2.5 rounded-xl bg-white border border-stoneline text-xs flex items-start justify-between gap-2"
+                              >
+                                <div className="space-y-0.5">
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <strong className="font-bold text-ink">{evt.senderName}</strong>
+                                    {evt.senderRole && (
+                                      <span
+                                        className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${
+                                          evt.senderRole === 'HUNTER'
+                                            ? 'bg-hunter-light text-hunter'
+                                            : 'bg-cedar-light text-cedar'
+                                        }`}
+                                      >
+                                        {evt.senderRole}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p className="text-ink-secondary font-medium leading-snug">{evt.message}</p>
+                                </div>
+                                <span className="text-[10px] font-mono text-ink-muted shrink-0">
+                                  {new Date(evt.createdAt).toLocaleTimeString([], {
+                                    hour: '2-digit',
+                                    minute: '2-digit',
+                                    second: '2-digit',
+                                  })}
+                                </span>
+                              </div>
+                            ))}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 )}
 
                 {/* TAB 2: PLAYERS */}
-                {activeTab === 'players' && (
-                  <div className="space-y-2">
+                {effectiveTab === 'players' && (
+                  <div className="space-y-3">
+                    {/* Fallback Tactical Abilities & Notes when Radio is Disabled */}
+                    {!isRadioEnabled && (
+                      <div className="space-y-3">
+                        {!isHunter ? (
+                          <div className="p-3.5 rounded-xl bg-canvas border border-stoneline text-xs text-ink-secondary space-y-3">
+                            <strong className="text-ink block">Hider Tactical Abilities &amp; Status</strong>
+                            <div className="flex flex-wrap items-center gap-2.5">
+                              {catchMode === 'CATCH_PIN' && snapshot.viewerCatchPin && (
+                                <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-300 text-amber-950">
+                                  <span className="block text-[10px] uppercase font-bold text-amber-800">2-Digit Catch PIN</span>
+                                  <span className="font-mono font-extrabold text-lg tracking-widest text-hunter">{snapshot.viewerCatchPin}</span>
+                                </div>
+                              )}
+                              <div className="p-2.5 rounded-xl bg-white border border-stoneline flex-1 min-w-[200px] flex items-center justify-between gap-2">
+                                <div>
+                                  <strong className="text-ink block text-xs">👻 Ghost Cloak (60s Stealth)</strong>
+                                  <span className="text-[11px] text-ink-muted">
+                                    {snapshot.viewerGhostCloak?.active
+                                      ? `Cloaked (${snapshot.viewerGhostCloak.secondsLeft}s left)`
+                                      : snapshot.viewerGhostCloak?.used
+                                      ? 'Used in this match'
+                                      : 'Hides your location from Hunters for 60s'}
+                                  </span>
+                                </div>
+                                {!snapshot.viewerGhostCloak?.used && !snapshot.viewerGhostCloak?.active && (
+                                  <button
+                                    type="button"
+                                    disabled={snapshot.state !== 'ACTIVE' || me?.status !== 'ACTIVE'}
+                                    onClick={() => {
+                                      soundEngine.playGhostCloakTone();
+                                      dispatchGameAction({ action: 'ACTIVATE_GHOST_CLOAK' }, '👻 Ghost Cloak Activated for 60s!');
+                                    }}
+                                    className="min-h-[38px] px-3 py-1.5 rounded-xl bg-purple-800 hover:bg-purple-900 text-white font-bold text-xs shrink-0 disabled:opacity-40"
+                                  >
+                                    Activate
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                            {me?.photoRequest?.status === 'PENDING' && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setCapturedPhotoUrl(null);
+                                  setCameraStreamError(null);
+                                  setShowCameraModal(true);
+                                }}
+                                className="btn-hunter px-3.5 py-2 rounded-xl text-xs font-bold"
+                              >
+                                📷 Respond to Photo Request ({me.photoRequest.expiresInSeconds}s left)
+                              </button>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="p-3.5 rounded-xl bg-canvas border border-stoneline space-y-2 text-xs">
+                            <strong className="text-ink block">
+                              Hunter Siren Alerts: {snapshot.soundAbility?.remainingUses ?? 0} / {snapshot.soundAbility?.maxUses ?? 3}
+                            </strong>
+                            <div className="flex flex-wrap gap-2">
+                              {snapshot.participants
+                                .filter((p) => p.role === 'HIDER')
+                                .map((h) => {
+                                  const isCaught = h.status !== 'ACTIVE';
+                                  const sa = snapshot.soundAbility;
+                                  const soundDisabled =
+                                    snapshot.state !== 'ACTIVE' ||
+                                    isCaught ||
+                                    !sa ||
+                                    sa.remainingUses <= 0 ||
+                                    sa.cooldownSecondsLeft > 0;
+                                  return (
+                                    <button
+                                      key={h.id}
+                                      type="button"
+                                      disabled={soundDisabled}
+                                      onClick={async () => {
+                                        const res = await dispatchGameAction({ action: 'SEND_SOUND', targetHiderId: h.id });
+                                        if (res?.deliveryStatus) showToast(res.deliveryStatus, 'info');
+                                      }}
+                                      className="btn-hunter px-3 py-1.5 rounded-lg text-[11px] font-bold disabled:opacity-40"
+                                    >
+                                      🔊 Ping {h.nickname}
+                                    </button>
+                                  );
+                                })}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    <div className="space-y-2">
                     {snapshot.participants.map((p) => {
                       const isMe = p.id === activePlayerId;
                       const showCaptureButton =
@@ -5076,138 +5411,46 @@ function AuiManhuntApp() {
                       );
                     })}
                   </div>
-                )}
+                </div>
+              )}
 
-                {/* TAB 3: LIVE FEED */}
-                {activeTab === 'feed' && (
-                  <div className="space-y-3">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
-                        <span className="text-base">📋</span>
-                        <div>
-                          <h3 className="font-display font-bold text-xs sm:text-sm text-ink">
-                            Live Notes &amp; Activity Feed
-                          </h3>
-                          <p className="text-[11px] text-ink-muted">
-                            Broadcast instant text notes &amp; sound alerts to all players’ screens (6s top banner + chime)
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="flex flex-wrap gap-1.5">
-                      {QUICK_NOTE_PRESETS.map((preset) => (
-                        <button
-                          key={preset}
-                          type="button"
-                          disabled={pendingActionKey === 'SEND_NOTE'}
-                          onClick={() => handleSendNote(preset)}
-                          className="min-h-[36px] px-2.5 py-1 rounded-xl bg-canvas hover:bg-subtle border border-stoneline text-[11px] font-semibold text-ink transition disabled:opacity-50"
-                        >
-                          {preset}
-                        </button>
-                      ))}
-                    </div>
-
-                    <form
-                      onSubmit={(e) => {
-                        e.preventDefault();
-                        handleSendNote();
-                      }}
-                      className="flex items-center gap-2"
-                    >
-                      <input
-                        type="text"
-                        maxLength={140}
-                        value={noteInput}
-                        onChange={(e) => setNoteInput(e.target.value)}
-                        placeholder="Write a live note or alert to all players..."
-                        className="flex-1 h-11 px-3.5 rounded-xl bg-canvas border border-stoneline text-xs font-medium text-ink focus:outline-none focus:border-cedar"
-                      />
-                      <button
-                        type="submit"
-                        disabled={!noteInput.trim() || pendingActionKey === 'SEND_NOTE'}
-                        className="btn-cedar h-11 px-4 rounded-xl text-xs font-bold shrink-0 disabled:opacity-45"
-                      >
-                        {pendingActionKey === 'SEND_NOTE' ? '⏳...' : '🔔 Send Note'}
-                      </button>
-                    </form>
-
-                    {snapshot.events && snapshot.events.length > 0 && (
-                      <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1 pt-1.5 border-t border-stoneline">
-                        {[...snapshot.events]
-                          .slice()
-                          .reverse()
-                          .map((evt) => (
-                            <div
-                              key={evt.id}
-                              className="p-2.5 rounded-xl bg-canvas border border-stoneline text-xs flex items-start justify-between gap-2"
-                            >
-                              <div className="space-y-0.5">
-                                <div className="flex items-center gap-1.5 flex-wrap">
-                                  <strong className="font-bold text-ink">{evt.senderName}</strong>
-                                  {evt.senderRole && (
-                                    <span
-                                      className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${
-                                        evt.senderRole === 'HUNTER'
-                                          ? 'bg-hunter-light text-hunter'
-                                          : 'bg-cedar-light text-cedar'
-                                      }`}
-                                    >
-                                      {evt.senderRole}
-                                    </span>
-                                  )}
-                                </div>
-                                <p className="text-ink-secondary font-medium leading-snug">{evt.message}</p>
-                              </div>
-                              <span className="text-[10px] font-mono text-ink-muted shrink-0">
-                                {new Date(evt.createdAt).toLocaleTimeString([], {
-                                  hour: '2-digit',
-                                  minute: '2-digit',
-                                  second: '2-digit',
-                                })}
-                              </span>
-                            </div>
-                          ))}
-                      </div>
-                    )}
+              {/* TAB 3: SAFETY & HOST */}
+              {effectiveTab === 'safety' && (
+                <div className="space-y-3">
+                  <div className="p-3.5 rounded-xl bg-canvas border border-stoneline text-xs text-ink-secondary leading-relaxed">
+                    <strong className="text-ink block mb-1">Campus Safety &amp; Screen Wake Lock</strong>
+                    Stay on lit walkways and open campus plazas. Keep this screen open—Screen Wake Lock (☀️ Awake) automatically prevents your phone from sleeping during active play so your GPS and audio alerts remain live.
                   </div>
-                )}
 
-                {/* TAB 4: SAFETY & HOST */}
-                {activeTab === 'safety' && (
-                  <div className="space-y-3">
-                    <div className="p-3.5 rounded-xl bg-canvas border border-stoneline text-xs text-ink-secondary leading-relaxed">
-                      <strong className="text-ink block mb-1">Campus Safety &amp; Screen Wake Lock</strong>
-                      Stay on lit walkways and open campus plazas. Keep this screen open—Screen Wake Lock (☀️ Awake) automatically prevents your phone from sleeping during active play so your GPS and audio alerts remain live.
-                    </div>
-
-                    <div className="flex flex-wrap gap-2.5">
-                      {isHost && (
-                        <button
-                          type="button"
-                          onClick={() => dispatchGameAction({ action: 'TOGGLE_PAUSE' })}
-                          className="btn-secondary px-4 py-2.5 rounded-xl text-xs font-bold"
-                        >
-                          {snapshot.state === 'PAUSED' ? 'Resume Game' : 'Pause Game'}
-                        </button>
-                      )}
+                  <div className="flex flex-wrap gap-2.5">
+                    {isHost && (
                       <button
                         type="button"
-                        onClick={() => dispatchGameAction({ action: 'EMERGENCY_STOP' }, 'Game stopped immediately. All live GPS sharing ended.')}
-                        className="min-h-[44px] px-4 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs font-bold"
+                        onClick={() => dispatchGameAction({ action: 'TOGGLE_PAUSE' })}
+                        className="btn-secondary px-4 py-2.5 rounded-xl text-xs font-bold"
                       >
-                        Emergency Stop Game
+                        {snapshot.state === 'PAUSED' ? 'Resume Game' : 'Pause Game'}
                       </button>
-                      <button type="button" onClick={handleLeaveGame} className="btn-secondary px-4 py-2.5 rounded-xl text-xs font-semibold ml-auto">
-                        Leave &amp; Stop GPS
-                      </button>
-                    </div>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => dispatchGameAction({ action: 'EMERGENCY_STOP' }, 'Game stopped immediately. All live GPS sharing ended.')}
+                      className="min-h-[44px] px-4 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs font-bold"
+                    >
+                      Emergency Stop Game
+                    </button>
+                    <button type="button" onClick={handleLeaveGame} className="btn-secondary px-4 py-2.5 rounded-xl text-xs font-semibold ml-auto">
+                      Leave &amp; Stop GPS
+                    </button>
                   </div>
-                )}
-              </div>
-            </section>
-          )}
+                </div>
+              )}
+            </>
+          );
+        })()}
+      </div>
+    </section>
+  )}
 
         {snapshot && snapshot.state === 'FINISHED' && (
           <section className="flex-1 flex flex-col justify-center py-4">

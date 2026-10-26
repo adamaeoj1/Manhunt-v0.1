@@ -12,6 +12,8 @@ import {
   submitParticipantGps,
   getAuthorizedGameState,
   getRoomPreview,
+  getRadioClip,
+  getPhotoRequestMedia,
   normalizeRoomCode,
 } from '@/lib/game-engine';
 
@@ -42,6 +44,46 @@ export async function GET(req: NextRequest) {
         );
       }
       return NextResponse.json({ preview }, { headers: NO_STORE_HEADERS });
+    }
+
+    const clipId = req.nextUrl.searchParams.get('clipId');
+    if (clipId) {
+      if (!cleanCode) {
+        return NextResponse.json(
+          { error: 'Valid room code is required.' },
+          { status: 400, headers: NO_STORE_HEADERS }
+        );
+      }
+      const clip = await getRadioClip(cleanCode, clipId);
+      if (!clip) {
+        return NextResponse.json(
+          { error: 'Radio clip was not found or expired.' },
+          { status: 404, headers: NO_STORE_HEADERS }
+        );
+      }
+      return NextResponse.json({ clip }, { headers: NO_STORE_HEADERS });
+    }
+
+    const photoRequestId = req.nextUrl.searchParams.get('photoRequestId');
+    const photoHiderId = req.nextUrl.searchParams.get('photoHiderId');
+    if (photoRequestId || photoHiderId) {
+      if (!cleanCode) {
+        return NextResponse.json(
+          { error: 'Valid room code is required.' },
+          { status: 400, headers: NO_STORE_HEADERS }
+        );
+      }
+      const photo = await getPhotoRequestMedia(cleanCode, {
+        photoRequestId: photoRequestId || undefined,
+        hiderId: photoHiderId || undefined,
+      });
+      if (!photo) {
+        return NextResponse.json(
+          { error: 'Requested photo was not found or expired.' },
+          { status: 404, headers: NO_STORE_HEADERS }
+        );
+      }
+      return NextResponse.json({ photo }, { headers: NO_STORE_HEADERS });
     }
 
     const viewerId = (req.nextUrl.searchParams.get('participantId') || '').trim();

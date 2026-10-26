@@ -74,7 +74,8 @@ export interface WalkieTalkieMessageRecord {
   senderId: string;
   senderNickname: string;
   senderRole: PlayerRole | null;
-  audioDataUrl: string;
+  audioDataUrl?: string;
+  hasAudio?: boolean;
   voiceText?: string;
   disguised: boolean;
   durationSeconds: number;
@@ -87,6 +88,7 @@ export interface VoiceClipRecord {
   senderNickname: string;
   senderRole: PlayerRole | null;
   audioDataUrl?: string;
+  hasAudio?: boolean;
   voiceText?: string;
   disguised: boolean;
   durationSeconds: number;
@@ -930,6 +932,7 @@ export async function performGameAction(code: string, payload: Record<string, un
       saveRoomToSharedStore(game);
       return { ok: true };
     }
+    case 'UPDATE_LOBBY_SETTINGS':
     case 'UPDATE_RULES': {
       if (game.hostId !== participantId) throw new Error('Only the host can update game settings.');
       if (payload.walkieTalkieEnabled !== undefined) {
@@ -942,8 +945,12 @@ export async function performGameAction(code: string, payload: Record<string, un
         }
       }
       if (game.state === 'LOBBY') {
-        game.settings.hunterCount = Math.max(1, Math.min(5, Number(payload.hunterCount) || 1));
-        game.settings.durationMinutes = Math.max(5, Math.min(90, Number(payload.durationMinutes) || 20));
+        if (payload.hunterCount !== undefined) {
+          game.settings.hunterCount = Math.max(1, Math.min(5, Number(payload.hunterCount) || 1));
+        }
+        if (payload.durationMinutes !== undefined) {
+          game.settings.durationMinutes = Math.max(5, Math.min(90, Number(payload.durationMinutes) || 20));
+        }
         if (payload.countdownSeconds !== undefined) {
           game.settings.countdownSeconds = Math.max(0, Math.min(120, Number(payload.countdownSeconds)));
         }
@@ -1766,6 +1773,12 @@ async function performSupabaseGameAction(
     case 'SEND_TAUNT':
     case 'SEND_WALKIE_TALKIE':
     case 'ACTIVATE_GHOST_CLOAK': {
+      const localGame = loadRoomFromSharedStore(cleanCode);
+      if (localGame) {
+        try {
+          await performGameAction(cleanCode, { ...payload, action, participantId });
+        } catch {}
+      }
       return { ok: true };
     }
     case 'REMATCH': {
@@ -1855,23 +1868,29 @@ export async function getAuthorizedGameState(
         game.outsideSinceByParticipant.delete(p.id);
       }
 
+      const isHunterHidingLock = Boolean(
+        viewerRole === 'HUNTER' && actualRole === 'HIDER' && game.state === 'COUNTDOWN'
+      );
+
       const hunterCanSee =
-        game.state !== 'COUNTDOWN' &&
         viewerRole === 'HUNTER' &&
         (actualRole === 'HUNTER' ||
-          (actualRole === 'HIDER' && (!ghostCloakActive || isOutOfBoundsExposed)));
+          (!isHunterHidingLock && actualRole === 'HIDER' && (!ghostCloakActive || isOutOfBoundsExposed)));
 
       const hiderTeammateCanSee =
-        game.state !== 'COUNTDOWN' &&
         viewerRole === 'HIDER' &&
         game.settings.teammateVisibility !== 'HIDE_TEAMMATES' &&
         actualRole === 'HIDER';
 
-      const hiderCanSeeHunter =
-        game.state !== 'COUNTDOWN' &&
-        viewerRole === 'HIDER' &&
-        actualRole === 'HUNTER' &&
-        game.settings.hunterVisibilityMode !== 'HIDDEN';
+      let hiderCanSeeHunter = false;
+      if (viewerRole === 'HIDER' && actualRole === 'HUNTER') {
+        if (game.settings.hunterVisibilityMode === 'ALWAYS_LIVE') {
+          hiderCanSeeHunter = true;
+        } else if (game.settings.hunterVisibilityMode === 'RADAR_PING_15S') {
+          const cycleSecond = Math.floor(now / 1000) % 15;
+          hiderCanSeeHunter = cycleSecond < 3;
+        }
+      }
 
       const canSeeLoc = isSelf || hunterCanSee || hiderTeammateCanSee || hiderCanSeeHunter;
 
@@ -1894,17 +1913,13 @@ export async function getAuthorizedGameState(
       const pr = game.photoRequestsByHider.get(p.id);
       if (pr) {
         const canViewPhoto = Boolean(pr.photoDataUrl && (viewerRole === 'HUNTER' || isSelf));
-        // Delta sync: only transmit heavy Base64 photoDataUrl if newly submitted after sinceMs or explicitly requested
-        const isNewPhoto = Boolean(
-          canViewPhoto &&
-            (includeMedia || !sinceMs || (pr.submittedAt && pr.submittedAt >= sinceMs - 3500))
-        );
+        const shouldIncludePhoto = Boolean(canViewPhoto && includeMedia);
         photoRequestView = {
           id: pr.id,
           status: pr.status,
           expiresInSeconds: Math.max(0, Math.ceil((pr.expiresAt - now) / 1000)),
           hasPhoto: canViewPhoto,
-          photoDataUrl: isNewPhoto ? pr.photoDataUrl : null,
+          photoDataUrl: shouldIncludePhoto ? pr.photoDataUrl : null,
           remainingRequests: remainingPhotoRequests,
         };
       }
@@ -1973,13 +1988,13 @@ export async function getAuthorizedGameState(
 
     if (game.state === 'ACTIVE' && viewer.status === 'ACTIVE') {
       const myLoc = game.locations.get(viewerId);
-      if (myLoc) {
+      if (myLoc && (myLoc.accuracy ?? 999) <= 45) {
         let minHunterDist = Infinity;
         for (const [pid, role] of Array.from(game.secretRoles.entries())) {
           if (role === 'HUNTER') {
             const hLoc = game.locations.get(pid);
             const hPart = game.participants.get(pid);
-            if (hLoc && hPart && hPart.status === 'ACTIVE') {
+            if (hLoc && (hLoc.accuracy ?? 999) <= 45 && hPart && hPart.status === 'ACTIVE') {
               const d = calculateDistanceMeters(myLoc.lat, myLoc.lng, hLoc.lat, hLoc.lng);
               if (d < minHunterDist) minHunterDist = d;
             }
@@ -2002,6 +2017,40 @@ export async function getAuthorizedGameState(
     game.soundAlerts.filter((a) => a.targetHiderId === viewerId && a.createdAt >= eventCutoffMs).slice(-1)[0] || null;
 
   const recentWalkieMessages = game.walkieMessages.filter((m) => m.createdAt >= eventCutoffMs);
+  const rawLatestVoiceClip =
+    game.latestVoiceClip && now - game.latestVoiceClip.createdAt < 25000
+      ? game.latestVoiceClip
+      : null;
+
+  // Optimize payload: strip heavy Base64 audioDataUrl from regular polling to prevent memory leaks and payload bloat
+  const sanitizedRecentWalkie = recentWalkieMessages.map((m) => ({
+    id: m.id,
+    senderId: m.senderId,
+    senderNickname: m.senderNickname,
+    senderRole: m.senderRole,
+    voiceText: m.voiceText,
+    disguised: m.disguised,
+    durationSeconds: m.durationSeconds,
+    createdAt: m.createdAt,
+    hasAudio: Boolean(m.audioDataUrl && m.audioDataUrl.length > 0),
+    audioDataUrl: includeMedia ? m.audioDataUrl : '',
+  }));
+
+  const latestVoiceClip = rawLatestVoiceClip
+    ? {
+        id: rawLatestVoiceClip.id,
+        senderId: rawLatestVoiceClip.senderId,
+        senderNickname: rawLatestVoiceClip.senderNickname,
+        senderRole: rawLatestVoiceClip.senderRole,
+        voiceText: rawLatestVoiceClip.voiceText,
+        disguised: rawLatestVoiceClip.disguised,
+        durationSeconds: rawLatestVoiceClip.durationSeconds,
+        createdAt: rawLatestVoiceClip.createdAt,
+        hasAudio: Boolean(rawLatestVoiceClip.audioDataUrl && rawLatestVoiceClip.audioDataUrl.length > 0),
+        audioDataUrl: includeMedia ? rawLatestVoiceClip.audioDataUrl : undefined,
+      }
+    : null;
+
   const recentTaunts = game.tauntAlerts.filter((t) => t.createdAt >= eventCutoffMs);
   const tauntCooldownSecondsLeft = Math.max(
     0,
@@ -2017,7 +2066,9 @@ export async function getAuthorizedGameState(
     serverTime: now,
     serverNowMs: now,
     headStartEndsAtMs: game.countdownEndsAt,
+    headStartEndsAt: game.countdownEndsAt,
     gameEndsAtMs: game.endsAt,
+    endsAt: game.endsAt,
     pausedRemainingMs: game.pausedRemainingMs,
     hostId: game.hostId,
     viewerId,
@@ -2045,11 +2096,9 @@ export async function getAuthorizedGameState(
     events: (game.events || []).slice(-30),
     soundAbility: soundAbilityView,
     recentTargetedAlert,
-    recentWalkieMessages,
-    latestVoiceClip:
-      game.latestVoiceClip && now - game.latestVoiceClip.createdAt < 25000
-        ? game.latestVoiceClip
-        : null,
+    recentWalkieMessages: sanitizedRecentWalkie,
+    latestVoiceClip,
+    latestRadioClipId: rawLatestVoiceClip?.id || null,
     recentTaunts,
     tauntCooldownSecondsLeft,
     participants: participantsView,
@@ -2242,12 +2291,12 @@ async function getSupabaseAuthorizedState(
   };
   if (viewerRole === 'HIDER' && currentState === 'ACTIVE' && viewer.status === 'ACTIVE') {
     const myLoc = locMap.get(viewerId);
-    if (myLoc) {
+    if (myLoc && (myLoc.accuracy_m ?? 999) <= 45) {
       let minHunterDist = Infinity;
       for (const [pid, role] of Array.from(roleMap.entries())) {
         if (role === 'HUNTER') {
           const hLoc = locMap.get(pid);
-          if (hLoc) {
+          if (hLoc && (hLoc.accuracy_m ?? 999) <= 45) {
             const d = calculateDistanceMeters(myLoc.lat, myLoc.lng, hLoc.lat, hLoc.lng);
             if (d < minHunterDist) minHunterDist = d;
           }
@@ -2271,7 +2320,9 @@ async function getSupabaseAuthorizedState(
     serverTime: now,
     serverNowMs: now,
     headStartEndsAtMs: countdownEndsMs,
+    headStartEndsAt: countdownEndsMs,
     gameEndsAtMs: endsMs,
+    endsAt: endsMs,
     pausedRemainingMs: gameRow.paused_remaining_ms ?? null,
     hostId: gameRow.host_participant_id,
     viewerId,
@@ -2323,8 +2374,74 @@ async function getSupabaseAuthorizedState(
     recentTargetedAlert,
     recentWalkieMessages: [] as WalkieTalkieMessageRecord[],
     latestVoiceClip: null,
+    latestRadioClipId: null,
     recentTaunts: [] as TauntAlertRecord[],
     tauntCooldownSecondsLeft: 0,
     participants: participantsView,
   };
+}
+
+export async function getRadioClip(code: string, clipId: string): Promise<VoiceClipRecord | null> {
+  const cleanCode = normalizeRoomCode(code);
+  const localGame = loadRoomFromSharedStore(cleanCode);
+  if (!localGame) return null;
+  if (localGame.latestVoiceClip && localGame.latestVoiceClip.id === clipId) {
+    return localGame.latestVoiceClip;
+  }
+  const found = localGame.walkieMessages.find((m) => m.id === clipId);
+  if (found) {
+    return {
+      id: found.id,
+      senderId: found.senderId,
+      senderNickname: found.senderNickname,
+      senderRole: found.senderRole,
+      audioDataUrl: found.audioDataUrl,
+      voiceText: found.voiceText,
+      disguised: found.disguised,
+      durationSeconds: found.durationSeconds,
+      createdAt: found.createdAt,
+    };
+  }
+  return null;
+}
+
+export async function getPhotoRequestMedia(
+  code: string,
+  params: { photoRequestId?: string; hiderId?: string }
+): Promise<{ id: string; photoDataUrl: string | null } | null> {
+  const cleanCode = normalizeRoomCode(code);
+  const localGame = loadRoomFromSharedStore(cleanCode);
+  if (localGame) {
+    if (params.hiderId) {
+      const pr = localGame.photoRequestsByHider.get(params.hiderId);
+      if (pr && pr.photoDataUrl) {
+        return { id: pr.id, photoDataUrl: pr.photoDataUrl };
+      }
+    }
+    if (params.photoRequestId) {
+      for (const pr of Array.from(localGame.photoRequestsByHider.values())) {
+        if (pr.id === params.photoRequestId && pr.photoDataUrl) {
+          return { id: pr.id, photoDataUrl: pr.photoDataUrl };
+        }
+      }
+    }
+  }
+
+  if (isSupabaseConfigured()) {
+    try {
+      const sb = getSupabaseAdminClient();
+      let query = sb.from('photo_requests').select('id, photo_data_url');
+      if (params.photoRequestId) {
+        query = query.eq('id', params.photoRequestId);
+      } else if (params.hiderId) {
+        query = query.eq('target_participant_id', params.hiderId);
+      }
+      const { data } = await query.maybeSingle();
+      if (data && data.photo_data_url) {
+        return { id: data.id, photoDataUrl: data.photo_data_url };
+      }
+    } catch {}
+  }
+
+  return null;
 }
