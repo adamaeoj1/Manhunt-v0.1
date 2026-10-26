@@ -75,6 +75,19 @@ export interface WalkieTalkieMessageRecord {
   senderNickname: string;
   senderRole: PlayerRole | null;
   audioDataUrl: string;
+  voiceText?: string;
+  disguised: boolean;
+  durationSeconds: number;
+  createdAt: number;
+}
+
+export interface VoiceClipRecord {
+  id: string;
+  senderId: string;
+  senderNickname: string;
+  senderRole: PlayerRole | null;
+  audioDataUrl?: string;
+  voiceText?: string;
   disguised: boolean;
   durationSeconds: number;
   createdAt: number;
@@ -166,6 +179,7 @@ export interface GameRecord {
   outsideSinceByParticipant: Map<string, number>;
   ghostCloakByHider: Map<string, { usedCount: number; maxUses: number; activeUntil: number }>;
   catchPinsByHider: Map<string, string>;
+  latestVoiceClip: VoiceClipRecord | null;
 }
 
 const AVATAR_COLORS = ['#14532D', '#C2410C', '#0369A1', '#7E22CE', '#B45309', '#BE123C'];
@@ -210,6 +224,7 @@ interface SerializedGameRecord {
   soundUsage: Array<[string, { usedCount: number; cooldownUntil: number }]>;
   soundAlerts: SoundAlertRecord[];
   walkieMessages: WalkieTalkieMessageRecord[];
+  latestVoiceClip?: VoiceClipRecord | null;
   tauntAlerts: TauntAlertRecord[];
   capturesLog: CaptureLogRecord[];
   events?: GameEventRecord[];
@@ -242,6 +257,7 @@ function serializeGameRecord(game: GameRecord): SerializedGameRecord {
     soundUsage: Array.from(game.soundUsage.entries()),
     soundAlerts: game.soundAlerts,
     walkieMessages: game.walkieMessages,
+    latestVoiceClip: game.latestVoiceClip || null,
     tauntAlerts: game.tauntAlerts,
     capturesLog: game.capturesLog,
     events: game.events || [],
@@ -275,6 +291,7 @@ function deserializeGameRecord(raw: SerializedGameRecord): GameRecord {
     soundUsage: new Map(raw.soundUsage || []),
     soundAlerts: raw.soundAlerts || [],
     walkieMessages: raw.walkieMessages || [],
+    latestVoiceClip: raw.latestVoiceClip || null,
     tauntAlerts: raw.tauntAlerts || [],
     capturesLog: raw.capturesLog || [],
     events: raw.events || [],
@@ -595,6 +612,7 @@ export async function createGameSession(input: {
     soundUsage: new Map(),
     soundAlerts: [],
     walkieMessages: [],
+    latestVoiceClip: null,
     tauntAlerts: [],
     capturesLog: [],
     events: [],
@@ -988,6 +1006,7 @@ export async function performGameAction(code: string, payload: Record<string, un
       game.soundUsage.clear();
       game.soundAlerts = [];
       game.walkieMessages = [];
+      game.latestVoiceClip = null;
       game.tauntAlerts = [];
       game.capturesLog = [];
       game.tauntCooldownByParticipant.clear();
@@ -1095,36 +1114,56 @@ export async function performGameAction(code: string, payload: Record<string, un
       if (!game.settings.walkieTalkieEnabled) {
         throw new Error('Walkie-Talkie radio is disabled by the host.');
       }
-      const audioDataUrl = String(payload.audioDataUrl || '');
-      if (!audioDataUrl) throw new Error('Audio clip is required.');
+      const audioDataUrl = payload.audioDataUrl ? String(payload.audioDataUrl) : undefined;
+      const voiceText = payload.voiceText ? String(payload.voiceText).trim() : undefined;
+      if (!audioDataUrl && !voiceText) {
+        throw new Error('Either an audio recording or voice text is required.');
+      }
       const disguised = Boolean(payload.disguised);
-      const durationSeconds = Math.max(0.5, Math.min(8, Number(payload.durationSeconds) || 3));
+      const durationSeconds = Math.max(0.5, Math.min(8, Number(payload.durationSeconds) || (voiceText ? 3 : 2)));
       const now = Date.now();
 
-      const msg: WalkieTalkieMessageRecord = {
-        id: generateSecureId('wt'),
+      const clipId = generateSecureId('wt');
+      const voiceClip: VoiceClipRecord = {
+        id: clipId,
         senderId: participantId,
         senderNickname: actor.nickname,
         senderRole: game.secretRoles.get(participantId) || null,
         audioDataUrl,
+        voiceText,
         disguised,
         durationSeconds,
         createdAt: now,
       };
-      game.walkieMessages = game.walkieMessages
+
+      game.latestVoiceClip = voiceClip;
+      game.walkieMessages = (game.walkieMessages || [])
         .filter((m) => now - m.createdAt < 25000)
         .slice(-5);
-      game.walkieMessages.push(msg);
+      game.walkieMessages.push({
+        id: clipId,
+        senderId: participantId,
+        senderNickname: actor.nickname,
+        senderRole: game.secretRoles.get(participantId) || null,
+        audioDataUrl: audioDataUrl || '',
+        voiceText,
+        disguised,
+        durationSeconds,
+        createdAt: now,
+      });
+
       appendGameEvent(game, {
         type: 'WALKIE',
         senderId: participantId,
         senderName: actor.nickname,
         senderRole: game.secretRoles.get(participantId) || null,
-        message: `📻 ${actor.nickname} sent a Walkie-Talkie radio transmission (${durationSeconds}s${disguised ? ', disguised' : ''}).`,
+        message: voiceText
+          ? `📻 Radio [${actor.nickname}]: "${voiceText}"`
+          : `📻 ${actor.nickname} sent a Walkie-Talkie radio transmission (${durationSeconds}s${disguised ? ', disguised' : ''}).`,
         createdAt: now,
       });
       saveRoomToSharedStore(game);
-      return { ok: true, messageId: msg.id };
+      return { ok: true, messageId: clipId, clip: voiceClip };
     }
     case 'SEND_TAUNT': {
       const tauntTypeRaw = String(payload.tauntType || 'CATCH_ME');
@@ -1420,6 +1459,7 @@ export async function performGameAction(code: string, payload: Record<string, un
       game.soundUsage.clear();
       game.soundAlerts = [];
       game.walkieMessages = [];
+      game.latestVoiceClip = null;
       game.tauntAlerts = [];
       game.capturesLog = [];
       game.events = [];
@@ -2006,6 +2046,10 @@ export async function getAuthorizedGameState(
     soundAbility: soundAbilityView,
     recentTargetedAlert,
     recentWalkieMessages,
+    latestVoiceClip:
+      game.latestVoiceClip && now - game.latestVoiceClip.createdAt < 25000
+        ? game.latestVoiceClip
+        : null,
     recentTaunts,
     tauntCooldownSecondsLeft,
     participants: participantsView,
@@ -2278,6 +2322,7 @@ async function getSupabaseAuthorizedState(
     soundAbility: soundAbilityView,
     recentTargetedAlert,
     recentWalkieMessages: [] as WalkieTalkieMessageRecord[],
+    latestVoiceClip: null,
     recentTaunts: [] as TauntAlertRecord[],
     tauntCooldownSecondsLeft: 0,
     participants: participantsView,

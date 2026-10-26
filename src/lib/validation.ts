@@ -101,7 +101,8 @@ export const GameActionSchema = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('SEND_WALKIE_TALKIE'),
     participantId: z.string().min(1),
-    audioDataUrl: z.string().min(1).max(600_000),
+    audioDataUrl: z.string().max(600_000).optional().nullable(),
+    voiceText: z.string().max(160).optional().nullable(),
     disguised: z.boolean().optional().default(false),
     durationSeconds: z.number().min(0.3).max(8).optional().default(3),
   }),

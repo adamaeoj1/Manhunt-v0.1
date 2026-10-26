@@ -627,10 +627,12 @@ class ManhuntSoundEngine {
   /**
    * Plays an incoming or outgoing Walkie-Talkie voice clip with radio squelch
    * and optional Voice Disguise (pitch shift + bandpass filter).
+   * Decodes Base64 to ArrayBuffer and plays via Web Audio API AudioBufferSourceNode
+   * to guarantee bypass of browser autoplay policies on iOS Safari & Android Chrome.
    */
-  public async playWalkieAudioMessage(
-    audioDataUrl: string,
-    disguised = false,
+  public async playWalkieTalkieAudio(
+    base64DataUrl: string,
+    disguisePitch = false,
     onEnded?: () => void
   ): Promise<boolean> {
     this.playRadioSquelch('START');
@@ -643,11 +645,11 @@ class ManhuntSoundEngine {
     try {
       const ctx = await this.ensureContextRunning();
       const dest = ctx ? this.getDestination(ctx) : null;
-      if (!audioDataUrl || audioDataUrl === 'SYNTH_VOICE' || !audioDataUrl.startsWith('data:audio')) {
-        // Fallback synthesized walkie-talkie voice cadence when mic isn't available
+      if (!base64DataUrl || base64DataUrl === 'SYNTH_VOICE' || !base64DataUrl.startsWith('data:audio')) {
+        // Fallback synthesized walkie-talkie voice cadence when mic hardware is unavailable
         if (ctx && dest) {
           const now = ctx.currentTime + 0.16;
-          const syllables = disguised
+          const syllables = disguisePitch
             ? [190, 215, 175, 230, 165, 205]
             : [310, 360, 290, 390, 280, 340];
           syllables.forEach((freq, idx) => {
@@ -662,7 +664,7 @@ class ManhuntSoundEngine {
             osc.frequency.linearRampToValueAtTime(freq * 0.92, start + dur);
 
             filter.type = 'bandpass';
-            filter.frequency.setValueAtTime(disguised ? 950 : 1350, start);
+            filter.frequency.setValueAtTime(disguisePitch ? 950 : 1350, start);
             filter.Q.setValueAtTime(1.2, start);
 
             gain.gain.setValueAtTime(0.001, start);
@@ -680,9 +682,9 @@ class ManhuntSoundEngine {
         return true;
       }
 
-      // Decode base64 Data URL into ArrayBuffer
-      const commaIdx = audioDataUrl.indexOf(',');
-      const base64 = commaIdx >= 0 ? audioDataUrl.slice(commaIdx + 1) : audioDataUrl;
+      // Convert Base64 data URL to ArrayBuffer for Web Audio API decodeAudioData
+      const commaIdx = base64DataUrl.indexOf(',');
+      const base64 = commaIdx >= 0 ? base64DataUrl.slice(commaIdx + 1) : base64DataUrl;
       const binaryString = window.atob(base64);
       const len = binaryString.length;
       const bytes = new Uint8Array(len);
@@ -695,15 +697,15 @@ class ManhuntSoundEngine {
           const decodedBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0));
           const source = ctx.createBufferSource();
           source.buffer = decodedBuffer;
-          source.playbackRate.value = disguised ? 0.78 : 1.0;
+          source.playbackRate.value = disguisePitch ? 0.78 : 1.0;
 
           const radioFilter = ctx.createBiquadFilter();
           radioFilter.type = 'bandpass';
-          radioFilter.frequency.setValueAtTime(disguised ? 980 : 1450, ctx.currentTime);
+          radioFilter.frequency.setValueAtTime(disguisePitch ? 980 : 1450, ctx.currentTime);
           radioFilter.Q.setValueAtTime(0.85, ctx.currentTime);
 
           const boostGain = ctx.createGain();
-          boostGain.gain.setValueAtTime(1.6, ctx.currentTime);
+          boostGain.gain.setValueAtTime(1.75, ctx.currentTime);
 
           source.connect(radioFilter);
           radioFilter.connect(boostGain);
@@ -712,21 +714,21 @@ class ManhuntSoundEngine {
           source.onended = () => {
             finishPlayback();
           };
-          source.start(ctx.currentTime + 0.14);
+          source.start(ctx.currentTime + 0.12);
           return true;
         } catch {
-          // Fall through to HTMLAudioElement fallback if decodeAudioData fails on codec
+          // Fall through to HTMLAudioElement fallback if decodeAudioData encounters codec issues
         }
       }
 
-      const audioEl = new Audio(audioDataUrl);
+      const audioEl = new Audio(base64DataUrl);
       audioEl.volume = 1.0;
       const anyAudio = audioEl as HTMLAudioElement & {
         preservesPitch?: boolean;
         mozPreservesPitch?: boolean;
         webkitPreservesPitch?: boolean;
       };
-      if (disguised) {
+      if (disguisePitch) {
         anyAudio.preservesPitch = false;
         anyAudio.mozPreservesPitch = false;
         anyAudio.webkitPreservesPitch = false;
@@ -739,6 +741,68 @@ class ManhuntSoundEngine {
     } catch {
       finishPlayback();
       return false;
+    }
+  }
+
+  /**
+   * Alias for backwards compatibility.
+   */
+  public async playWalkieAudioMessage(
+    audioDataUrl: string,
+    disguised = false,
+    onEnded?: () => void
+  ): Promise<boolean> {
+    return this.playWalkieTalkieAudio(audioDataUrl, disguised, onEnded);
+  }
+
+  /**
+   * Silent Radio Text-to-Speech (TTS) Fallback:
+   * Speaks a quick tactical radio message using the browser's native SpeechSynthesis API,
+   * preceded and followed by realistic walkie-talkie radio squelch tones.
+   */
+  public playSilentRadioTTS(
+    text: string,
+    disguised = false,
+    onEnded?: () => void
+  ): boolean {
+    this.playRadioSquelch('START');
+
+    const cleanText = text.trim();
+    if (!cleanText) {
+      this.playRadioSquelch('END');
+      if (onEnded) onEnded();
+      return false;
+    }
+
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(cleanText);
+        utterance.lang = 'en-US';
+        utterance.pitch = disguised ? 0.65 : 1.05;
+        utterance.rate = disguised ? 0.92 : 1.08;
+        utterance.volume = 1.0;
+
+        utterance.onend = () => {
+          this.playRadioSquelch('END');
+          if (onEnded) onEnded();
+        };
+        utterance.onerror = () => {
+          this.playRadioSquelch('END');
+          if (onEnded) onEnded();
+        };
+
+        window.speechSynthesis.speak(utterance);
+        return true;
+      } catch {
+        this.playRadioSquelch('END');
+        if (onEnded) onEnded();
+        return false;
+      }
+    } else {
+      // Fallback to procedural radio syllables
+      this.playWalkieTalkieAudio('SYNTH_VOICE', disguised, onEnded);
+      return true;
     }
   }
 
