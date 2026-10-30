@@ -14,24 +14,10 @@ export interface MapParticipantMarker {
   isStale: boolean;
 }
 
-export interface AuiLandmark {
-  id: string;
-  name: string;
-  category: string;
-  icon: string;
-  lat: number;
-  lng: number;
-}
-
-export const AUI_LANDMARKS: AuiLandmark[] = [
-  { id: 'gate', name: 'Main Gate (البوابة الرئيسية)', category: 'Entrance', icon: '🚪', lat: 33.54115, lng: -5.10520 },
-  { id: 'mosque', name: 'Mosque (المسجد)', category: 'Worship', icon: '🕌', lat: 33.54055, lng: -5.10740 },
-  { id: 'library', name: 'Mohammed VI Library (المكتبة)', category: 'Study', icon: '🏛️', lat: 33.53890, lng: -5.10670 },
-  { id: 'student_center', name: 'Student Center & Dining (مركز الطلاب والمطعم)', category: 'Dining', icon: '🍽️', lat: 33.54020, lng: -5.10590 },
-  { id: 'quad', name: 'Academic Quad (المباني الأكاديمية)', category: 'Classes', icon: '🎓', lat: 33.53950, lng: -5.10650 },
-  { id: 'sports', name: 'Sports Complex & Pool (المجمع الرياضي)', category: 'Athletics', icon: '⚽', lat: 33.53895, lng: -5.10780 },
-  { id: 'dorms', name: 'Residence Halls / Dorms (السكن الجامعي)', category: 'Housing', icon: '🏢', lat: 33.54070, lng: -5.10470 },
-];
+export const AUI_CAMPUS_CENTER = {
+  lat: 33.53965,
+  lng: -5.10710,
+};
 
 interface CampusMapProps {
   mode: 'setup' | 'gameplay';
@@ -40,6 +26,8 @@ interface CampusMapProps {
   onSetupBoundaryMove?: (lat: number, lng: number) => void;
   centerCommand?: { lat: number; lng: number; zoom?: number; ts: number } | null;
   fitBoundaryCommand?: number;
+  onCenterMe?: () => void;
+  onFitBoundary?: () => void;
 }
 
 interface CachedMarkerEntry {
@@ -65,6 +53,8 @@ function CampusMapInner({
   onSetupBoundaryMove,
   centerCommand,
   fitBoundaryCommand,
+  onCenterMe,
+  onFitBoundary,
 }: CampusMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
@@ -76,12 +66,10 @@ function CampusMapInner({
   const lastFitCmdRef = useRef<number>(0);
 
   const [mapLayer, setMapLayer] = useState<'street' | 'satellite'>('street');
-  const [showLandmarks, setShowLandmarks] = useState(false);
 
   const streetLayerRef = useRef<any>(null);
   const satLayerRef = useRef<any>(null);
   const satLabelsRef = useRef<any>(null);
-  const landmarkMarkersRef = useRef<any[]>([]);
 
   const onSetupBoundaryMoveRef = useRef<CampusMapProps['onSetupBoundaryMove']>(onSetupBoundaryMove);
 
@@ -107,12 +95,17 @@ function CampusMapInner({
       if (!isMounted || !containerRef.current) return;
       leafletRef.current = L;
 
-      const initialZoom = boundary.radiusMeters >= 320 ? 16 : 16;
+      // Lock zoom strictly to campus buildings (zoom 17 default, min 15, max 19)
+      const centerLat = boundary.lat || AUI_CAMPUS_CENTER.lat;
+      const centerLng = boundary.lng || AUI_CAMPUS_CENTER.lng;
+
       const map = L.map(containerRef.current, {
-        zoomControl: mode === 'setup',
+        zoomControl: false,
         scrollWheelZoom: mode === 'gameplay',
-        attributionControl: true,
-      }).setView([boundary.lat, boundary.lng], initialZoom);
+        attributionControl: false,
+        minZoom: 15,
+        maxZoom: 19,
+      }).setView([centerLat, centerLng], 17);
 
       if (mode === 'gameplay') {
         L.control.zoom({ position: 'bottomleft' }).addTo(map);
@@ -142,19 +135,19 @@ function CampusMapInner({
       // Default street view
       streetLayerRef.current.addTo(map);
 
-      const circle = L.circle([boundary.lat, boundary.lng], {
+      const circle = L.circle([centerLat, centerLng], {
         radius: boundary.radiusMeters,
-        color: '#14532D',
+        color: '#065F46', // emerald-800
         weight: mode === 'setup' ? 2.5 : 3,
         dashArray: mode === 'gameplay' ? '6, 6' : undefined,
-        fillColor: '#14532D',
-        fillOpacity: mode === 'setup' ? 0.14 : 0.08,
+        fillColor: '#065F46',
+        fillOpacity: mode === 'setup' ? 0.12 : 0.08,
         interactive: false,
       }).addTo(map);
 
       if (mode === 'setup') {
         const centerHtml = `
-          <div style="width:18px; height:18px; border-radius:9999px; background:#14532D; border:3px solid #FFFFFF; box-shadow:0 2px 6px rgba(0,0,0,0.35);"></div>
+          <div style="width:18px; height:18px; border-radius:9999px; background:#065F46; border:3px solid #FFFFFF; box-shadow:0 2px 6px rgba(0,0,0,0.35);"></div>
         `;
         const centerIcon = L.divIcon({
           html: centerHtml,
@@ -162,7 +155,7 @@ function CampusMapInner({
           iconSize: [18, 18],
           iconAnchor: [9, 9],
         });
-        setupCenterMarkerRef.current = L.marker([boundary.lat, boundary.lng], {
+        setupCenterMarkerRef.current = L.marker([centerLat, centerLng], {
           icon: centerIcon,
           interactive: false,
         }).addTo(map);
@@ -208,7 +201,6 @@ function CampusMapInner({
         boundaryCircleRef.current = null;
         setupCenterMarkerRef.current = null;
         markersMapRef.current.clear();
-        landmarkMarkersRef.current = [];
       }
     };
   }, []);
@@ -242,44 +234,6 @@ function CampusMapInner({
     } catch {}
   }, [mapLayer]);
 
-  // Toggle AUI Landmarks Markers
-  useEffect(() => {
-    const map = mapRef.current;
-    const L = leafletRef.current;
-    if (!map || !L) return;
-
-    // Clear existing landmark markers
-    landmarkMarkersRef.current.forEach((m) => {
-      try {
-        map.removeLayer(m);
-      } catch {}
-    });
-    landmarkMarkersRef.current = [];
-
-    if (showLandmarks) {
-      AUI_LANDMARKS.forEach((lm) => {
-        const html = `
-          <div style="display:inline-flex; align-items:center; gap:3px; background:rgba(15, 23, 42, 0.88); color:#FFFFFF; border:1.5px solid rgba(255, 255, 255, 0.45); border-radius:8px; padding:2.5px 6.5px; font-size:10.5px; font-weight:800; white-space:nowrap; box-shadow:0 3px 8px rgba(0,0,0,0.45); pointer-events:none;">
-            <span style="font-size:12px;">${lm.icon}</span>
-            <span>${lm.name}</span>
-          </div>
-        `;
-        const icon = L.divIcon({
-          html,
-          className: '',
-          iconSize: [120, 24],
-          iconAnchor: [60, 12],
-        });
-        const marker = L.marker([lm.lat, lm.lng], {
-          icon,
-          interactive: false,
-          zIndexOffset: 50, // Below player pins
-        }).addTo(map);
-        landmarkMarkersRef.current.push(marker);
-      });
-    }
-  }, [showLandmarks]);
-
   useEffect(() => {
     if (!boundaryCircleRef.current) return;
     boundaryCircleRef.current.setLatLng([boundary.lat, boundary.lng]);
@@ -295,7 +249,7 @@ function CampusMapInner({
     lastCenterTsRef.current = centerCommand.ts;
     mapRef.current.invalidateSize({ animate: false });
     mapRef.current.flyTo([centerCommand.lat, centerCommand.lng], centerCommand.zoom || 17, {
-      duration: 0.55,
+      duration: 0.5,
     });
   }, [centerCommand]);
 
@@ -304,7 +258,7 @@ function CampusMapInner({
     if (fitBoundaryCommand === lastFitCmdRef.current) return;
     lastFitCmdRef.current = fitBoundaryCommand;
     mapRef.current.invalidateSize({ animate: false });
-    mapRef.current.fitBounds(boundaryCircleRef.current.getBounds(), { padding: [24, 24] });
+    mapRef.current.fitBounds(boundaryCircleRef.current.getBounds(), { padding: [24, 24], maxZoom: 18 });
   }, [fitBoundaryCommand]);
 
   useEffect(() => {
@@ -358,41 +312,31 @@ function CampusMapInner({
         activeIds.add(m.id);
         const pos = displayCoords.get(m.id) || { lat: m.lat, lng: m.lng };
         const isHunter = m.role === 'HUNTER';
-        const pinBg = isHunter ? '#DC2626' : '#15803D';
-        const badgeBg = isHunter ? '#991B1B' : '#14532D';
-        const roleLabel = isHunter ? 'HUNTER' : 'HIDER';
-        const ageText = m.isStale ? `Stale ${m.ageSeconds}s` : `${m.ageSeconds}s`;
+        const pinBg = m.isSelf ? '#2563EB' : isHunter ? '#E11D48' : '#047857';
         const zOffset = m.isSelf ? 1000 : isHunter ? 500 : 100;
+        const initials = m.nickname.slice(0, 2).toUpperCase();
 
         const buildIcon = () => {
-          const selfBadge = m.isSelf
-            ? `<span style="background:#2563EB;color:#FFFFFF;padding:1px 5px;border-radius:5px;font-weight:800;font-size:9px;margin-right:3px;">YOU</span>`
-            : '';
-          const roleBadge = `<span style="background:${badgeBg};color:#FFFFFF;padding:1px 5px;border-radius:5px;font-weight:800;font-size:9px;margin-right:4px;">${roleLabel}</span>`;
-          const selfRingStyle = m.isSelf
-            ? 'border:3px solid #FFFFFF; box-shadow: 0 0 0 4px #2563EB, 0 0 14px rgba(37,99,235,0.75);'
+          const pulseRing = m.isSelf
+            ? `<div style="position:absolute; inset:-4px; border-radius:9999px; background:rgba(37,99,235,0.28); animation:ping 2s cubic-bezier(0, 0, 0.2, 1) infinite;"></div>`
             : isHunter
-            ? 'border:3px solid #FEE2E2; box-shadow: 0 0 0 2px #991B1B, 0 3px 10px rgba(0,0,0,0.35);'
-            : 'border:3px solid #DCFCE7; box-shadow: 0 0 0 2px #14532D, 0 3px 10px rgba(0,0,0,0.3);';
+            ? `<div style="position:absolute; inset:-3px; border-radius:9999px; background:rgba(225,29,72,0.22); animation:pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;"></div>`
+            : '';
 
           const html = `
-            <div style="position:relative; width:40px; height:40px;">
-              ${
-                m.isSelf
-                  ? `<div style="position:absolute; inset:-6px; border-radius:9999px; border:2.5px solid #3B82F6; opacity:0.75; pointer-events:none;"></div>`
-                  : ''
-              }
-              <div class="campus-marker-pin" style="width:40px; height:40px; background:${pinBg}; ${selfRingStyle} opacity:${
-            m.isStale ? '0.68' : '1'
-          }; font-size:13px;">
-                ${m.nickname.slice(0, 2).toUpperCase()}
+            <div style="position:relative; width:34px; height:34px; display:flex; align-items:center; justify-content:center;">
+              ${pulseRing}
+              <div style="width:30px; height:30px; border-radius:9999px; background:${pinBg}; border:2.5px solid #FFFFFF; box-shadow:0 2px 8px rgba(0,0,0,0.25); display:flex; align-items:center; justify-content:center; color:#FFFFFF; font-weight:800; font-size:11px; z-index:2; opacity:${m.isStale ? '0.65' : '1'};">
+                ${initials}
               </div>
-              <div class="marker-label-pill" style="display:flex; align-items:center; gap:2px;">
-                ${selfBadge}${roleBadge}<span>${m.nickname} (±${m.accuracy}m • ${ageText})</span>
+              <div style="position:absolute; top:32px; left:50%; transform:translateX(-50%); background:rgba(255,255,255,0.96); backdrop-filter:blur(4px); border:1px solid rgba(0,0,0,0.08); box-shadow:0 2px 6px rgba(0,0,0,0.12); padding:1.5px 6px; border-radius:8px; font-size:10px; font-weight:700; color:#1C1917; white-space:nowrap; pointer-events:none; z-index:3; display:flex; align-items:center; gap:3px;">
+                ${m.isSelf ? '<span style="color:#2563EB; font-weight:900;">YOU</span>•' : ''}
+                <span>${m.nickname}</span>
+                <span style="color:#78716C; font-weight:500;">±${m.accuracy}m</span>
               </div>
             </div>
           `;
-          return L.divIcon({ html, className: '', iconSize: [40, 40], iconAnchor: [20, 20] });
+          return L.divIcon({ html, className: '', iconSize: [34, 34], iconAnchor: [17, 17] });
         };
 
         const existing = markersMapRef.current.get(m.id);
@@ -401,10 +345,10 @@ function CampusMapInner({
           const marker = L.marker([pos.lat, pos.lng], { icon, zIndexOffset: zOffset }).addTo(map);
           const circle = L.circle([m.lat, m.lng], {
             radius: m.accuracy,
-            color: m.isSelf ? '#2563EB' : pinBg,
+            color: pinBg,
             weight: m.isSelf ? 1.5 : 1,
-            fillColor: m.isSelf ? '#3B82F6' : pinBg,
-            fillOpacity: 0.1,
+            fillColor: pinBg,
+            fillOpacity: 0.08,
             interactive: false,
           }).addTo(map);
           markersMapRef.current.set(m.id, {
@@ -478,25 +422,33 @@ function CampusMapInner({
         style={{ position: 'relative', zIndex: 1, isolation: 'isolate', width: '100%', height: '100%' }}
         className={`map-stack-container w-full h-full ${mode === 'setup' ? 'cursor-crosshair' : ''}`}
       />
-      <div className="absolute top-3 right-3 z-[1000] flex items-center gap-1.5 pointer-events-auto">
+      {/* Sleek Floating Map Controls in Top-Right Corner */}
+      <div className="absolute top-2.5 right-2.5 z-[500] flex items-center gap-1.5 pointer-events-auto">
         <button
           type="button"
           onClick={() => setMapLayer((prev) => (prev === 'street' ? 'satellite' : 'street'))}
-          className="h-8 px-2.5 rounded-lg bg-white/95 backdrop-blur border border-stone-300 shadow-md text-xs font-bold text-stone-800 hover:bg-stone-100 transition flex items-center gap-1 select-none"
+          className="text-xs px-2.5 py-1.5 backdrop-blur-md bg-white/90 hover:bg-white border border-stone-200/80 shadow-sm rounded-lg font-medium text-stone-800 transition flex items-center gap-1 select-none"
         >
-          <span>{mapLayer === 'street' ? '🛰️ قمر صناعي / Satellite' : '🗺️ خريطة / Street'}</span>
+          <span>{mapLayer === 'street' ? '🛰️ Satellite' : '🗺️ Street Map'}</span>
         </button>
-        <button
-          type="button"
-          onClick={() => setShowLandmarks((prev) => !prev)}
-          className={`h-8 px-2.5 rounded-lg backdrop-blur border shadow-md text-xs font-bold transition flex items-center gap-1 select-none ${
-            showLandmarks
-              ? 'bg-emerald-800 text-white border-emerald-900 shadow-emerald-900/30'
-              : 'bg-white/95 border-stone-300 text-stone-800 hover:bg-stone-100'
-          }`}
-        >
-          <span>📍 معالم الجامعة / Landmarks</span>
-        </button>
+        {onCenterMe && (
+          <button
+            type="button"
+            onClick={onCenterMe}
+            className="text-xs px-2.5 py-1.5 backdrop-blur-md bg-white/90 hover:bg-white border border-stone-200/80 shadow-sm rounded-lg font-medium text-stone-800 transition flex items-center gap-1 select-none"
+          >
+            <span>🎯 Center</span>
+          </button>
+        )}
+        {onFitBoundary && (
+          <button
+            type="button"
+            onClick={onFitBoundary}
+            className="text-xs px-2.5 py-1.5 backdrop-blur-md bg-white/90 hover:bg-white border border-stone-200/80 shadow-sm rounded-lg font-medium text-stone-800 transition flex items-center gap-1 select-none"
+          >
+            <span>📍 Play Zone</span>
+          </button>
+        )}
       </div>
     </div>
   );

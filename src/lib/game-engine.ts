@@ -374,6 +374,109 @@ function appendGameEvent(
   return record;
 }
 
+export interface SupabasePackedMetadata {
+  __packed?: boolean;
+  latestVoiceClip?: VoiceClipRecord | null;
+  latestRadioCallout?: LatestRadioCalloutRecord | null;
+  events?: GameEventRecord[];
+  settings?: Partial<GameRecord['settings']>;
+  realWinReason?: string | null;
+}
+
+export function unpackSupabaseGameMetadata(gameRow: any): SupabasePackedMetadata {
+  if (!gameRow) return {};
+  let result: SupabasePackedMetadata = {};
+
+  // 1. Unpack from packed win_reason fallback if present
+  if (typeof gameRow.win_reason === 'string' && gameRow.win_reason.startsWith('__PACKED_METADATA__:')) {
+    try {
+      const jsonStr = gameRow.win_reason.slice('__PACKED_METADATA__:'.length);
+      const parsed = JSON.parse(jsonStr) as SupabasePackedMetadata;
+      if (parsed && typeof parsed === 'object') {
+        result = { ...parsed };
+      }
+    } catch {}
+  }
+
+  // 2. Override with dedicated columns if present on row
+  if (gameRow.latest_voice_clip !== undefined && gameRow.latest_voice_clip !== null) {
+    result.latestVoiceClip = gameRow.latest_voice_clip;
+  }
+  if (gameRow.latest_radio_callout !== undefined && gameRow.latest_radio_callout !== null) {
+    result.latestRadioCallout = gameRow.latest_radio_callout;
+  }
+  if (gameRow.settings_json !== undefined && gameRow.settings_json !== null) {
+    result.settings = { ...(result.settings || {}), ...gameRow.settings_json };
+  }
+  if (Array.isArray(gameRow.events_json) && gameRow.events_json.length > 0) {
+    result.events = gameRow.events_json;
+  }
+
+  return result;
+}
+
+export async function saveSupabaseGameMetadata(
+  sb: any,
+  gameId: string,
+  updates: {
+    latestVoiceClip?: VoiceClipRecord | null;
+    latestRadioCallout?: LatestRadioCalloutRecord | null;
+    events?: GameEventRecord[];
+    settings?: Partial<GameRecord['settings']>;
+    realWinReason?: string | null;
+  }
+): Promise<void> {
+  const nowIso = new Date().toISOString();
+
+  // Try saving directly to dedicated JSONB columns
+  const dedicatedPayload: Record<string, unknown> = {
+    updated_at: nowIso,
+  };
+  if (updates.latestVoiceClip !== undefined) {
+    dedicatedPayload.latest_voice_clip = updates.latestVoiceClip;
+  }
+  if (updates.latestRadioCallout !== undefined) {
+    dedicatedPayload.latest_radio_callout = updates.latestRadioCallout;
+  }
+  if (updates.settings !== undefined) {
+    dedicatedPayload.settings_json = updates.settings;
+  }
+  if (updates.events !== undefined) {
+    dedicatedPayload.events_json = updates.events.slice(-40);
+  }
+
+  try {
+    const { error: dedicatedErr } = await sb.from('games').update(dedicatedPayload).eq('id', gameId);
+    if (!dedicatedErr) {
+      return;
+    }
+  } catch {
+    // If dedicated columns fail (e.g. missing in unmigrated schema), proceed to fallback below
+  }
+
+  // Zero-Migration Fallback: pack all metadata into win_reason TEXT column
+  try {
+    const { data: currentRow } = await sb.from('games').select('win_reason').eq('id', gameId).maybeSingle();
+    const existing = unpackSupabaseGameMetadata(currentRow);
+
+    const merged: SupabasePackedMetadata = {
+      __packed: true,
+      latestVoiceClip: updates.latestVoiceClip !== undefined ? updates.latestVoiceClip : existing.latestVoiceClip,
+      latestRadioCallout: updates.latestRadioCallout !== undefined ? updates.latestRadioCallout : existing.latestRadioCallout,
+      events: updates.events !== undefined ? updates.events.slice(-40) : existing.events,
+      settings: updates.settings !== undefined ? { ...(existing.settings || {}), ...updates.settings } : existing.settings,
+      realWinReason: updates.realWinReason !== undefined ? updates.realWinReason : existing.realWinReason,
+    };
+
+    await sb.from('games').update({
+      win_reason: `__PACKED_METADATA__:${JSON.stringify(merged)}`,
+      updated_at: nowIso,
+    }).eq('id', gameId);
+  } catch (err) {
+    console.error('Failed to save packed game metadata to Supabase fallback:', err);
+  }
+}
+
 function getRoomFilePath(cleanCode: string): string {
   return path.join(SHARED_STORE_DIR, `${cleanCode}.json`);
 }
@@ -610,6 +713,40 @@ export async function createGameSession(input: {
 
         if (!pErr && hostRow) {
           await sb.from('games').update({ host_participant_id: hostRow.id }).eq('id', gameRow.id);
+
+          const initialSettings: GameRecord['settings'] = {
+            maxPlayers: 12,
+            hunterCount: input.hunterCount,
+            durationMinutes: input.durationMinutes,
+            countdownSeconds: input.countdownSeconds,
+            gpsIntervalSeconds,
+            soundUsesPerHunter: input.soundUses,
+            soundCooldownSeconds: input.soundCooldownSeconds,
+            photoRequestsPerHider,
+            ghostCloakUsesPerHider,
+            walkieTalkieEnabled,
+            hunterVisibilityMode: input.hunterVisibilityMode ?? 'ALWAYS_LIVE',
+            catchVerificationMode,
+            outOfBoundsGraceSeconds,
+            teammateVisibility,
+            shrinkingZone,
+            initialRadiusMeters: input.boundary.radiusMeters,
+            boundary: input.boundary,
+          };
+          const initialEvent: GameEventRecord = {
+            id: generateSecureId('evt'),
+            type: 'SYSTEM',
+            senderId: hostRow.id,
+            senderName: cleanHostNickname,
+            senderRole: null,
+            message: `🏁 Lobby created by ${cleanHostNickname}. Waiting for players to join...`,
+            createdAt: now,
+          };
+          await saveSupabaseGameMetadata(sb, gameRow.id, {
+            settings: initialSettings,
+            events: [initialEvent],
+          });
+
           return { code, participantId: hostRow.id, storageMode: 'SUPABASE' as const };
         }
       }
@@ -727,6 +864,7 @@ export async function getRoomPreview(code: string) {
       const sb = getSupabaseAdminClient();
       const { data: gameRow } = await sb.from('games').select('*').eq('code', cleanCode).maybeSingle();
       if (gameRow) {
+        const meta = unpackSupabaseGameMetadata(gameRow);
         const { data: existingPlayers } = await sb.from('participants').select('nickname, is_host').eq('game_id', gameRow.id);
         const list = existingPlayers || [];
         const host = list.find((p) => p.is_host);
@@ -736,11 +874,11 @@ export async function getRoomPreview(code: string) {
           state: gameRow.state as GameState,
           hostNickname: host?.nickname || 'Host',
           playerCount: list.length,
-          maxPlayers: 12,
-          hunterCount: gameRow.hunter_count || 1,
-          durationMinutes: gameRow.duration_minutes || 20,
-          countdownSeconds: gameRow.countdown_seconds || 10,
-          radiusMeters: gameRow.boundary_radius_m || 390,
+          maxPlayers: meta.settings?.maxPlayers || 12,
+          hunterCount: gameRow.hunter_count || meta.settings?.hunterCount || 1,
+          durationMinutes: gameRow.duration_minutes || meta.settings?.durationMinutes || 20,
+          countdownSeconds: gameRow.countdown_seconds ?? meta.settings?.countdownSeconds ?? 10,
+          radiusMeters: gameRow.boundary_radius_m || meta.settings?.initialRadiusMeters || 390,
         };
       }
     } catch {}
@@ -1611,26 +1749,99 @@ async function performSupabaseGameAction(
       await sb.from('participants').update({ ready: !actorRow.ready }).eq('id', participantId);
       return { ok: true };
     }
+    case 'UPDATE_LOBBY_SETTINGS':
     case 'UPDATE_RULES': {
       if (gameRow.host_participant_id !== participantId) throw new Error('Only the host can update game settings.');
       if (gameRow.state === 'LOBBY') {
-        const updates: Record<string, unknown> = {
-          hunter_count: Math.max(1, Math.min(5, Number(payload.hunterCount) || 1)),
-          duration_minutes: Math.max(5, Math.min(90, Number(payload.durationMinutes) || 20)),
-        };
+        const gameUpdates: Record<string, unknown> = {};
+        const metaUpdates: Partial<GameRecord['settings']> = {};
+
+        if (payload.hunterCount !== undefined) {
+          const v = Math.max(1, Math.min(5, Number(payload.hunterCount) || 1));
+          gameUpdates.hunter_count = v;
+          metaUpdates.hunterCount = v;
+        }
+        if (payload.durationMinutes !== undefined) {
+          const v = Math.max(5, Math.min(90, Number(payload.durationMinutes) || 20));
+          gameUpdates.duration_minutes = v;
+          metaUpdates.durationMinutes = v;
+        }
         if (payload.countdownSeconds !== undefined) {
-          updates.countdown_seconds = Math.max(0, Math.min(120, Number(payload.countdownSeconds)));
+          const v = Math.max(0, Math.min(120, Number(payload.countdownSeconds)));
+          gameUpdates.countdown_seconds = v;
+          metaUpdates.countdownSeconds = v;
         }
         if (payload.soundUses !== undefined) {
-          updates.sound_uses_per_hunter = Math.max(1, Math.min(10, Number(payload.soundUses)));
+          const v = Math.max(1, Math.min(10, Number(payload.soundUses)));
+          gameUpdates.sound_uses_per_hunter = v;
+          metaUpdates.soundUsesPerHunter = v;
         }
         if (payload.soundCooldownSeconds !== undefined) {
-          updates.sound_cooldown_seconds = Math.max(30, Math.min(300, Number(payload.soundCooldownSeconds)));
+          const v = Math.max(30, Math.min(300, Number(payload.soundCooldownSeconds)));
+          gameUpdates.sound_cooldown_seconds = v;
+          metaUpdates.soundCooldownSeconds = v;
         }
         if (payload.boundaryRadiusMeters !== undefined) {
-          updates.boundary_radius_m = Math.max(80, Math.min(1500, Number(payload.boundaryRadiusMeters)));
+          const v = Math.max(80, Math.min(1500, Number(payload.boundaryRadiusMeters)));
+          gameUpdates.boundary_radius_m = v;
+          metaUpdates.initialRadiusMeters = v;
+          metaUpdates.boundary = {
+            lat: gameRow.boundary_lat,
+            lng: gameRow.boundary_lng,
+            radiusMeters: v,
+          };
         }
-        await sb.from('games').update(updates).eq('id', gameRow.id);
+        if (payload.walkieTalkieEnabled !== undefined) {
+          metaUpdates.walkieTalkieEnabled = Boolean(payload.walkieTalkieEnabled);
+        }
+        if (payload.hunterVisibilityMode !== undefined) {
+          const hVis = String(payload.hunterVisibilityMode);
+          if (hVis === 'ALWAYS_LIVE' || hVis === 'RADAR_PING_15S' || hVis === 'HIDDEN') {
+            metaUpdates.hunterVisibilityMode = hVis;
+          }
+        }
+        if (payload.catchVerificationMode !== undefined) {
+          const mode = String(payload.catchVerificationMode);
+          if (mode === 'PROXIMITY_20M' || mode === 'CATCH_PIN' || mode === 'INSTANT_TAP') {
+            metaUpdates.catchVerificationMode = mode;
+          }
+        }
+        if (payload.outOfBoundsGraceSeconds !== undefined) {
+          metaUpdates.outOfBoundsGraceSeconds = Math.max(15, Math.min(180, Number(payload.outOfBoundsGraceSeconds)));
+        }
+        if (payload.teammateVisibility !== undefined) {
+          const vis = String(payload.teammateVisibility);
+          if (vis === 'SHOW_TEAMMATES' || vis === 'HIDE_TEAMMATES') {
+            metaUpdates.teammateVisibility = vis;
+          }
+        }
+        if (payload.shrinkingZone !== undefined) {
+          metaUpdates.shrinkingZone = Boolean(payload.shrinkingZone);
+        }
+        if (payload.photoRequestsPerHider !== undefined) {
+          metaUpdates.photoRequestsPerHider = Math.max(0, Math.min(5, Number(payload.photoRequestsPerHider)));
+        }
+        if (payload.ghostCloakUsesPerHider !== undefined) {
+          metaUpdates.ghostCloakUsesPerHider = Math.max(0, Math.min(5, Number(payload.ghostCloakUsesPerHider)));
+        }
+        if (payload.gpsIntervalSeconds !== undefined) {
+          metaUpdates.gpsIntervalSeconds = Math.max(10, Math.min(180, Number(payload.gpsIntervalSeconds)));
+        }
+
+        if (Object.keys(gameUpdates).length > 0) {
+          await sb.from('games').update(gameUpdates).eq('id', gameRow.id);
+        }
+
+        await saveSupabaseGameMetadata(sb, gameRow.id, {
+          settings: metaUpdates,
+        });
+
+        const localGame = loadRoomFromSharedStore(cleanCode);
+        if (localGame) {
+          try {
+            await performGameAction(cleanCode, { ...payload, action: 'UPDATE_LOBBY_SETTINGS', participantId });
+          } catch {}
+        }
       }
       return { ok: true };
     }
@@ -1682,6 +1893,33 @@ async function performSupabaseGameAction(
           ends_at: endsAt.toISOString(),
         })
         .eq('id', gameRow.id);
+
+      const startEvent: GameEventRecord = {
+        id: generateSecureId('evt'),
+        type: 'SYSTEM',
+        senderId: participantId,
+        senderName: actorRow.nickname,
+        senderRole: assigned.get(participantId) || null,
+        message:
+          countdownMs > 0
+            ? `🚀 Round started! Hiders have ${gameRow.countdown_seconds}s head-start to hide!`
+            : '🚀 Round started! The Hunt is LIVE on campus!',
+        createdAt: now,
+      };
+
+      await saveSupabaseGameMetadata(sb, gameRow.id, {
+        latestVoiceClip: null,
+        latestRadioCallout: null,
+        events: [startEvent],
+        realWinReason: null,
+      });
+
+      const localGame = loadRoomFromSharedStore(cleanCode);
+      if (localGame) {
+        try {
+          await performGameAction(cleanCode, { ...payload, action, participantId });
+        } catch {}
+      }
 
       return { ok: true };
     }
@@ -1745,6 +1983,20 @@ async function performSupabaseGameAction(
         delivery_status: deliveryStatus,
       });
 
+      const meta = unpackSupabaseGameMetadata(gameRow);
+      const soundEvent: GameEventRecord = {
+        id: generateSecureId('snd'),
+        type: 'SOUND_ALERT',
+        senderId: participantId,
+        senderName: actorRow.nickname,
+        senderRole: 'HUNTER',
+        message: `🚨 Triggered a 4-second Siren Alert on ${targetRow?.nickname || 'Hider'}’s phone!`,
+        createdAt: now,
+      };
+      await saveSupabaseGameMetadata(sb, gameRow.id, {
+        events: [...(meta.events || []).slice(-39), soundEvent],
+      });
+
       return { ok: true, deliveryStatus };
     }
     case 'REQUEST_PHOTO': {
@@ -1767,6 +2019,22 @@ async function performSupabaseGameAction(
         expires_at: expiresIso,
       });
       if (prErr) throw new Error('This Hider’s photo request has already been used for this match.');
+
+      const { data: targetRow } = await sb.from('participants').select('nickname').eq('id', targetHiderId).maybeSingle();
+      const meta = unpackSupabaseGameMetadata(gameRow);
+      const photoEvt: GameEventRecord = {
+        id: generateSecureId('pht'),
+        type: 'PHOTO_REQUEST',
+        senderId: participantId,
+        senderName: actorRow.nickname,
+        senderRole: 'HUNTER',
+        message: `📸 Hunter requested a real-time photo clue from ${targetRow?.nickname || 'Hider'}!`,
+        createdAt: now,
+      };
+      await saveSupabaseGameMetadata(sb, gameRow.id, {
+        events: [...(meta.events || []).slice(-39), photoEvt],
+      });
+
       return { ok: true };
     }
     case 'RESPOND_PHOTO': {
@@ -1789,6 +2057,21 @@ async function performSupabaseGameAction(
         })
         .eq('game_id', gameRow.id)
         .eq('target_participant_id', participantId);
+
+      const meta = unpackSupabaseGameMetadata(gameRow);
+      const submitEvt: GameEventRecord = {
+        id: generateSecureId('pht'),
+        type: 'PHOTO_SUBMITTED',
+        senderId: participantId,
+        senderName: actorRow.nickname,
+        senderRole: 'HIDER',
+        message: `📸 ${actorRow.nickname} captured and submitted a real-time photo clue!`,
+        createdAt: now,
+      };
+      await saveSupabaseGameMetadata(sb, gameRow.id, {
+        events: [...(meta.events || []).slice(-39), submitEvt],
+      });
+
       return { ok: true };
     }
     case 'MARK_CAUGHT': {
@@ -1816,8 +2099,22 @@ async function performSupabaseGameAction(
         }
       }
 
+      const { data: targetRow } = await sb.from('participants').select('nickname').eq('id', targetHiderId).maybeSingle();
       await sb.from('participants').update({ status: 'CAPTURED' }).eq('id', targetHiderId);
       await sb.from('participant_locations').delete().eq('game_id', gameRow.id).eq('participant_id', targetHiderId);
+
+      const meta = unpackSupabaseGameMetadata(gameRow);
+      const captureEvt: GameEventRecord = {
+        id: generateSecureId('cap'),
+        type: 'CAPTURE',
+        senderId: participantId,
+        senderName: actorRow.nickname,
+        senderRole: isSelf ? 'HIDER' : 'HUNTER',
+        message: isSelf
+          ? `🎯 ${targetRow?.nickname || 'Hider'} reported themselves caught!`
+          : `🎯 ${actorRow.nickname} caught ${targetRow?.nickname || 'Hider'} on campus!`,
+        createdAt: now,
+      };
 
       const { data: hiderRoles } = await sb
         .from('participant_roles')
@@ -1828,16 +2125,26 @@ async function performSupabaseGameAction(
       const hiderIds = (hiderRoles || []).map((r) => r.participant_id);
       const { data: activeHiders } = await sb.from('participants').select('id').in('id', hiderIds).eq('status', 'ACTIVE');
 
+      let updatedEvents = [...(meta.events || []).slice(-39), captureEvt];
+      let realWinReason: string | null = null;
+
       if (!activeHiders || activeHiders.length === 0) {
+        realWinReason = 'All Hiders were caught on campus!';
         await sb
           .from('games')
           .update({
             state: 'FINISHED',
             winner_team: 'HUNTERS',
-            win_reason: 'All Hiders were caught on campus!',
+            win_reason: realWinReason,
           })
           .eq('id', gameRow.id);
       }
+
+      await saveSupabaseGameMetadata(sb, gameRow.id, {
+        events: updatedEvents,
+        realWinReason,
+      });
+
       return { ok: true };
     }
     case 'TOGGLE_PAUSE': {
@@ -1852,27 +2159,229 @@ async function performSupabaseGameAction(
       return { ok: true };
     }
     case 'EMERGENCY_STOP': {
+      const realWinReason = 'Game stopped early via Emergency / Host Stop.';
       await sb
         .from('games')
         .update({
           state: 'FINISHED',
           winner_team: 'NONE',
-          win_reason: 'Game stopped early via Emergency / Host Stop.',
+          win_reason: realWinReason,
         })
         .eq('id', gameRow.id);
+      await saveSupabaseGameMetadata(sb, gameRow.id, { realWinReason });
       return { ok: true };
     }
-    case 'SEND_NOTE':
-    case 'SEND_TAUNT':
-    case 'SEND_WALKIE_TALKIE':
-    case 'ACTIVATE_GHOST_CLOAK': {
+    case 'SEND_WALKIE_TALKIE': {
+      const audioDataUrl = payload.audioDataUrl ? String(payload.audioDataUrl) : undefined;
+      const voiceText = payload.voiceText ? String(payload.voiceText).trim() : undefined;
+      if (!audioDataUrl && !voiceText) {
+        throw new Error('Either an audio recording or voice text is required.');
+      }
+      const disguised = Boolean(payload.disguised);
+      const durationSeconds = Math.max(0.5, Math.min(8, Number(payload.durationSeconds) || (voiceText ? 3 : 2)));
+
+      const { data: roleRow } = await sb
+        .from('participant_roles')
+        .select('role')
+        .eq('game_id', gameRow.id)
+        .eq('participant_id', participantId)
+        .maybeSingle();
+      const callerRole = (roleRow?.role as PlayerRole) || null;
+
+      const clipId = generateSecureId('wt');
+      const voiceClip: VoiceClipRecord = {
+        id: clipId,
+        senderId: participantId,
+        senderNickname: actorRow.nickname,
+        senderRole: callerRole,
+        audioDataUrl,
+        voiceText,
+        disguised,
+        durationSeconds,
+        createdAt: now,
+      };
+
+      let radioCallout: LatestRadioCalloutRecord | null = null;
+      if (voiceText) {
+        radioCallout = {
+          id: clipId,
+          senderId: participantId,
+          senderName: actorRow.nickname,
+          senderRole: callerRole,
+          text: voiceText,
+          disguised,
+          type: 'TTS',
+          createdAt: now,
+        };
+      }
+
+      const walkieEvt: GameEventRecord = {
+        id: clipId,
+        type: 'WALKIE',
+        senderId: participantId,
+        senderName: actorRow.nickname,
+        senderRole: callerRole,
+        message: voiceText
+          ? `📻 Radio [${actorRow.nickname}]: "${voiceText}"`
+          : `📻 ${actorRow.nickname} sent a Walkie-Talkie radio transmission (${durationSeconds}s${disguised ? ', disguised' : ''}).`,
+        createdAt: now,
+      };
+
+      const meta = unpackSupabaseGameMetadata(gameRow);
+      const updatedEvents = [...(meta.events || []).slice(-39), walkieEvt];
+
+      await saveSupabaseGameMetadata(sb, gameRow.id, {
+        latestVoiceClip: voiceClip,
+        latestRadioCallout: radioCallout,
+        events: updatedEvents,
+      });
+
       const localGame = loadRoomFromSharedStore(cleanCode);
       if (localGame) {
         try {
           await performGameAction(cleanCode, { ...payload, action, participantId });
         } catch {}
       }
-      return { ok: true };
+
+      return { ok: true, messageId: clipId, clip: voiceClip };
+    }
+    case 'SEND_TAUNT': {
+      const tauntTypeRaw = String(payload.tauntType || 'CATCH_ME');
+      const validTypes: TauntType[] = ['CATCH_ME', 'I_SEE_YOU', 'AIRHORN', 'TOO_SLOW'];
+      const tauntType: TauntType = validTypes.includes(tauntTypeRaw as TauntType)
+        ? (tauntTypeRaw as TauntType)
+        : 'CATCH_ME';
+
+      const { data: roleRow } = await sb
+        .from('participant_roles')
+        .select('role')
+        .eq('game_id', gameRow.id)
+        .eq('participant_id', participantId)
+        .maybeSingle();
+      const callerRole = (roleRow?.role as PlayerRole) || null;
+
+      const tauntTextMap: Record<TauntType, string> = {
+        CATCH_ME: '😂 Catch Me If You Can!',
+        I_SEE_YOU: '👀 I See You!',
+        AIRHORN: '📯 Airhorn Taunt!',
+        TOO_SLOW: '👻 Too Slow!',
+      };
+      const tauntMsg = tauntTextMap[tauntType] || 'Taunt!';
+      const tauntId = generateSecureId('tnt');
+
+      const tauntCallout: LatestRadioCalloutRecord = {
+        id: tauntId,
+        senderId: participantId,
+        senderName: actorRow.nickname,
+        senderRole: callerRole,
+        text: tauntMsg,
+        disguised: false,
+        type: 'TAUNT',
+        tauntType,
+        createdAt: now,
+      };
+
+      const tauntEvt: GameEventRecord = {
+        id: tauntId,
+        type: 'TAUNT',
+        senderId: participantId,
+        senderName: actorRow.nickname,
+        senderRole: callerRole,
+        message: tauntMsg,
+        createdAt: now,
+      };
+
+      const meta = unpackSupabaseGameMetadata(gameRow);
+      const updatedEvents = [...(meta.events || []).slice(-39), tauntEvt];
+
+      await saveSupabaseGameMetadata(sb, gameRow.id, {
+        latestRadioCallout: tauntCallout,
+        events: updatedEvents,
+      });
+
+      const localGame = loadRoomFromSharedStore(cleanCode);
+      if (localGame) {
+        try {
+          await performGameAction(cleanCode, { ...payload, action, participantId });
+        } catch {}
+      }
+
+      return { ok: true, tauntId };
+    }
+    case 'SEND_NOTE': {
+      const rawMessage = String(payload.message || '').trim();
+      if (!rawMessage) throw new Error('Note message cannot be empty.');
+      if (rawMessage.length > 160) throw new Error('Note message cannot exceed 160 characters.');
+
+      const { data: roleRow } = await sb
+        .from('participant_roles')
+        .select('role')
+        .eq('game_id', gameRow.id)
+        .eq('participant_id', participantId)
+        .maybeSingle();
+      const callerRole = (roleRow?.role as PlayerRole) || null;
+
+      const noteEvt: GameEventRecord = {
+        id: generateSecureId('note'),
+        type: 'NOTE',
+        senderId: participantId,
+        senderName: actorRow.nickname,
+        senderRole: callerRole,
+        message: rawMessage,
+        createdAt: now,
+      };
+
+      const meta = unpackSupabaseGameMetadata(gameRow);
+      const updatedEvents = [...(meta.events || []).slice(-39), noteEvt];
+
+      await saveSupabaseGameMetadata(sb, gameRow.id, {
+        events: updatedEvents,
+      });
+
+      const localGame = loadRoomFromSharedStore(cleanCode);
+      if (localGame) {
+        try {
+          await performGameAction(cleanCode, { ...payload, action, participantId });
+        } catch {}
+      }
+
+      return { ok: true, eventId: noteEvt.id };
+    }
+    case 'ACTIVATE_GHOST_CLOAK': {
+      const { data: roleRow } = await sb
+        .from('participant_roles')
+        .select('role')
+        .eq('game_id', gameRow.id)
+        .eq('participant_id', participantId)
+        .maybeSingle();
+      const callerRole = (roleRow?.role as PlayerRole) || null;
+      if (callerRole !== 'HIDER') throw new Error('Only Hiders can activate Ghost Cloak.');
+
+      const cloakEvt: GameEventRecord = {
+        id: generateSecureId('clk'),
+        type: 'CLOAK',
+        senderId: participantId,
+        senderName: actorRow.nickname,
+        senderRole: 'HIDER',
+        message: `👻 ${actorRow.nickname} activated Ghost Cloak (location hidden for 60s)!`,
+        createdAt: now,
+      };
+
+      const meta = unpackSupabaseGameMetadata(gameRow);
+      const updatedEvents = [...(meta.events || []).slice(-39), cloakEvt];
+
+      await saveSupabaseGameMetadata(sb, gameRow.id, {
+        events: updatedEvents,
+      });
+
+      const localGame = loadRoomFromSharedStore(cleanCode);
+      if (localGame) {
+        try {
+          await performGameAction(cleanCode, { ...payload, action, participantId });
+        } catch {}
+      }
+
+      return { ok: true, activeUntil: now + 60000, remainingUses: 0 };
     }
     case 'REMATCH': {
       if (gameRow.host_participant_id !== participantId) throw new Error('Only the host can start a rematch.');
@@ -1882,6 +2391,21 @@ async function performSupabaseGameAction(
       await sb.from('photo_requests').delete().eq('game_id', gameRow.id);
       await sb.from('participants').update({ status: 'ACTIVE', ready: false }).eq('game_id', gameRow.id);
       await sb.from('games').update({ state: 'LOBBY', winner_team: null, win_reason: null }).eq('id', gameRow.id);
+
+      await saveSupabaseGameMetadata(sb, gameRow.id, {
+        latestVoiceClip: null,
+        latestRadioCallout: null,
+        events: [],
+        realWinReason: null,
+      });
+
+      const localGame = loadRoomFromSharedStore(cleanCode);
+      if (localGame) {
+        try {
+          await performGameAction(cleanCode, { ...payload, action, participantId });
+        } catch {}
+      }
+
       return { ok: true };
     }
     default:
@@ -2239,6 +2763,33 @@ async function getSupabaseAuthorizedState(
   const { data: gameRow } = await sb.from('games').select('*').eq('code', cleanCode).maybeSingle();
   if (!gameRow) throw new Error(`Room "${cleanCode}" not found or expired.`);
 
+  const meta = unpackSupabaseGameMetadata(gameRow);
+  const metaSettings = meta.settings || {};
+
+  const effectiveSettings: GameRecord['settings'] = {
+    maxPlayers: 12,
+    hunterCount: gameRow.hunter_count ?? metaSettings.hunterCount ?? 1,
+    durationMinutes: gameRow.duration_minutes ?? metaSettings.durationMinutes ?? 20,
+    countdownSeconds: gameRow.countdown_seconds ?? metaSettings.countdownSeconds ?? 10,
+    gpsIntervalSeconds: metaSettings.gpsIntervalSeconds ?? GPS_UPDATE_INTERVAL_SECONDS,
+    soundUsesPerHunter: gameRow.sound_uses_per_hunter ?? metaSettings.soundUsesPerHunter ?? 3,
+    soundCooldownSeconds: gameRow.sound_cooldown_seconds ?? metaSettings.soundCooldownSeconds ?? 90,
+    photoRequestsPerHider: metaSettings.photoRequestsPerHider ?? 1,
+    ghostCloakUsesPerHider: metaSettings.ghostCloakUsesPerHider ?? 1,
+    walkieTalkieEnabled: metaSettings.walkieTalkieEnabled !== false,
+    hunterVisibilityMode: (metaSettings.hunterVisibilityMode || gameRow.hunter_visibility_mode || 'ALWAYS_LIVE') as HunterVisibilityMode,
+    catchVerificationMode: (metaSettings.catchVerificationMode || 'PROXIMITY_20M') as CatchVerificationMode,
+    outOfBoundsGraceSeconds: metaSettings.outOfBoundsGraceSeconds || 60,
+    teammateVisibility: (metaSettings.teammateVisibility || 'SHOW_TEAMMATES') as TeammateVisibilityMode,
+    shrinkingZone: Boolean(metaSettings.shrinkingZone),
+    initialRadiusMeters: metaSettings.initialRadiusMeters || gameRow.boundary_radius_m,
+    boundary: {
+      lat: gameRow.boundary_lat,
+      lng: gameRow.boundary_lng,
+      radiusMeters: gameRow.boundary_radius_m,
+    },
+  };
+
   const now = Date.now();
   let currentState = gameRow.state as GameState;
   const countdownEndsMs = gameRow.countdown_ends_at ? new Date(gameRow.countdown_ends_at).getTime() : null;
@@ -2250,14 +2801,16 @@ async function getSupabaseAuthorizedState(
   }
   if (currentState === 'ACTIVE' && endsMs && now >= endsMs) {
     currentState = 'FINISHED';
+    const finishWinReason = 'Time expired with Hiders still free on campus!';
     await sb
       .from('games')
       .update({
         state: 'FINISHED',
         winner_team: 'HIDERS',
-        win_reason: 'Time expired with Hiders still free on campus!',
+        win_reason: finishWinReason,
       })
       .eq('id', gameRow.id);
+    await saveSupabaseGameMetadata(sb, gameRow.id, { realWinReason: finishWinReason });
   }
 
   const [
@@ -2313,7 +2866,7 @@ async function getSupabaseAuthorizedState(
     if (rawLoc && p.status === 'ACTIVE') {
       let hiderCanSeeHunter = false;
       if (viewerRole === 'HIDER' && actualRole === 'HUNTER') {
-        const hMode = gameRow.hunter_visibility_mode || 'ALWAYS_LIVE';
+        const hMode = effectiveSettings.hunterVisibilityMode || 'ALWAYS_LIVE';
         if (hMode === 'ALWAYS_LIVE') {
           hiderCanSeeHunter = true;
         } else if (hMode === 'RADAR_PING_15S') {
@@ -2321,11 +2874,15 @@ async function getSupabaseAuthorizedState(
           hiderCanSeeHunter = cycleSecond < 3;
         }
       }
+      const hiderTeammateCanSee =
+        viewerRole === 'HIDER' &&
+        effectiveSettings.teammateVisibility !== 'HIDE_TEAMMATES' &&
+        actualRole === 'HIDER';
       const canSeeLoc =
         isSelf ||
         (currentState !== 'COUNTDOWN' &&
           (viewerRole === 'HUNTER' ||
-            (viewerRole === 'HIDER' && actualRole === 'HIDER') ||
+            hiderTeammateCanSee ||
             hiderCanSeeHunter));
       if (canSeeLoc) {
         const updatedMs = new Date(rawLoc.updated_at).getTime();
@@ -2450,6 +3007,11 @@ async function getSupabaseAuthorizedState(
     }
   }
 
+  const cleanWinReason =
+    typeof gameRow.win_reason === 'string' && gameRow.win_reason.startsWith('__PACKED_METADATA__:')
+      ? meta.realWinReason || null
+      : gameRow.win_reason;
+
   return {
     id: gameRow.id,
     code: gameRow.code,
@@ -2472,29 +3034,7 @@ async function getSupabaseAuthorizedState(
     viewerCatchPin: null,
     viewerGhostCloak: { used: false, usedCount: 0, maxUses: 1, remainingUses: 1, active: false, activeUntilMs: 0, secondsLeft: 0 },
     hunterProximity,
-    settings: {
-      maxPlayers: 12,
-      hunterCount: gameRow.hunter_count,
-      durationMinutes: gameRow.duration_minutes,
-      countdownSeconds: gameRow.countdown_seconds,
-      gpsIntervalSeconds: GPS_UPDATE_INTERVAL_SECONDS,
-      soundUsesPerHunter: gameRow.sound_uses_per_hunter,
-      soundCooldownSeconds: gameRow.sound_cooldown_seconds,
-      photoRequestsPerHider: 1,
-      ghostCloakUsesPerHider: 1,
-      walkieTalkieEnabled: true,
-      hunterVisibilityMode: 'ALWAYS_LIVE' as HunterVisibilityMode,
-      catchVerificationMode: 'PROXIMITY_20M' as CatchVerificationMode,
-      outOfBoundsGraceSeconds: 60,
-      teammateVisibility: 'SHOW_TEAMMATES' as TeammateVisibilityMode,
-      shrinkingZone: false,
-      initialRadiusMeters: gameRow.boundary_radius_m,
-      boundary: {
-        lat: gameRow.boundary_lat,
-        lng: gameRow.boundary_lng,
-        radiusMeters: gameRow.boundary_radius_m,
-      },
-    },
+    settings: effectiveSettings,
     countdownSecondsLeft: countdownEndsMs ? Math.max(0, Math.ceil((countdownEndsMs - now) / 1000)) : 0,
     gameSecondsLeft:
       currentState === 'PAUSED'
@@ -2506,16 +3046,34 @@ async function getSupabaseAuthorizedState(
     activeHiders,
     capturedHiders: Math.max(0, totalHiders - activeHiders),
     winnerTeam: gameRow.winner_team,
-    winReason: gameRow.win_reason,
+    winReason: cleanWinReason,
     capturesLog: [] as CaptureLogRecord[],
-    events: [] as GameEventRecord[],
+    events: meta.events || [],
     soundAbility: soundAbilityView,
     recentTargetedAlert,
     recentWalkieMessages: [] as WalkieTalkieMessageRecord[],
-    latestVoiceClip: null,
-    latestRadioClipId: null,
-    latestRadioCallout: null,
-    latestRadioMessage: null,
+    latestVoiceClip: meta.latestVoiceClip || null,
+    latestRadioClipId: meta.latestVoiceClip?.id || null,
+    latestRadioCallout: meta.latestRadioCallout || null,
+    latestRadioMessage: meta.latestVoiceClip
+      ? {
+          id: meta.latestVoiceClip.id,
+          senderId: meta.latestVoiceClip.senderId,
+          senderName: meta.latestVoiceClip.senderNickname,
+          type: meta.latestVoiceClip.audioDataUrl ? 'AUDIO' : 'TTS',
+          content: meta.latestVoiceClip.voiceText || '',
+          createdAt: meta.latestVoiceClip.createdAt,
+        }
+      : meta.latestRadioCallout
+      ? {
+          id: meta.latestRadioCallout.id,
+          senderId: meta.latestRadioCallout.senderId,
+          senderName: meta.latestRadioCallout.senderName,
+          type: 'TTS',
+          content: meta.latestRadioCallout.text,
+          createdAt: meta.latestRadioCallout.createdAt,
+        }
+      : null,
     recentTaunts: [] as TauntAlertRecord[],
     tauntCooldownSecondsLeft: 0,
     participants: participantsView,
@@ -2525,24 +3083,39 @@ async function getSupabaseAuthorizedState(
 export async function getRadioClip(code: string, clipId: string): Promise<VoiceClipRecord | null> {
   const cleanCode = normalizeRoomCode(code);
   const localGame = loadRoomFromSharedStore(cleanCode);
-  if (!localGame) return null;
-  if (localGame.latestVoiceClip && localGame.latestVoiceClip.id === clipId) {
-    return localGame.latestVoiceClip;
+  if (localGame) {
+    if (localGame.latestVoiceClip && localGame.latestVoiceClip.id === clipId) {
+      return localGame.latestVoiceClip;
+    }
+    const found = localGame.walkieMessages.find((m) => m.id === clipId);
+    if (found) {
+      return {
+        id: found.id,
+        senderId: found.senderId,
+        senderNickname: found.senderNickname,
+        senderRole: found.senderRole,
+        audioDataUrl: found.audioDataUrl,
+        voiceText: found.voiceText,
+        disguised: found.disguised,
+        durationSeconds: found.durationSeconds,
+        createdAt: found.createdAt,
+      };
+    }
   }
-  const found = localGame.walkieMessages.find((m) => m.id === clipId);
-  if (found) {
-    return {
-      id: found.id,
-      senderId: found.senderId,
-      senderNickname: found.senderNickname,
-      senderRole: found.senderRole,
-      audioDataUrl: found.audioDataUrl,
-      voiceText: found.voiceText,
-      disguised: found.disguised,
-      durationSeconds: found.durationSeconds,
-      createdAt: found.createdAt,
-    };
+
+  if (isSupabaseConfigured()) {
+    try {
+      const sb = getSupabaseAdminClient();
+      const { data: gameRow } = await sb.from('games').select('*').eq('code', cleanCode).maybeSingle();
+      if (gameRow) {
+        const meta = unpackSupabaseGameMetadata(gameRow);
+        if (meta.latestVoiceClip && meta.latestVoiceClip.id === clipId) {
+          return meta.latestVoiceClip;
+        }
+      }
+    } catch {}
   }
+
   return null;
 }
 

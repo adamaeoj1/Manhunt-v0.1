@@ -553,6 +553,33 @@ const HunterLockedMapCountdownOverlay = React.memo(function HunterLockedMapCount
 });
 
 export default function AuiManhuntPage() {
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  if (!mounted) {
+    return (
+      <div className="min-h-screen w-full flex items-center justify-center bg-canvas text-ink" dir="ltr">
+        <div className="flex flex-col items-center justify-center space-y-4 p-6 text-center">
+          <div className="w-12 h-12 rounded-2xl bg-cedar flex items-center justify-center text-white shadow-md animate-pulse">
+            <svg className="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="9" />
+              <polygon points="15.5 8.5 13.5 13.5 8.5 15.5 10.5 10.5 15.5 8.5" fill="currentColor" stroke="none" />
+            </svg>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-4 h-4 border-2 border-cedar border-t-transparent rounded-full animate-spin" />
+            <span className="font-display font-bold text-sm tracking-tight text-ink">
+              Loading AUI Manhunt...
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <ManhuntErrorBoundary>
       <AuiManhuntApp />
@@ -579,6 +606,32 @@ function AuiManhuntApp() {
     content: string;
     audioDataUrl?: string;
   } | null>(null);
+
+  const [radioToast, setRadioToast] = useState<{
+    id: string;
+    senderName: string;
+    text?: string;
+    hasAudio?: boolean;
+    audioDataUrl?: string;
+  } | null>(null);
+  const radioToastTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const showRadioToast = useCallback(
+    (toastData: {
+      id: string;
+      senderName: string;
+      text?: string;
+      hasAudio?: boolean;
+      audioDataUrl?: string;
+    }) => {
+      setRadioToast(toastData);
+      if (radioToastTimerRef.current) clearTimeout(radioToastTimerRef.current);
+      radioToastTimerRef.current = setTimeout(() => {
+        setRadioToast(null);
+      }, 5000);
+    },
+    []
+  );
 
   // Setup state
   const [createNickname, setCreateNickname] = useState('');
@@ -725,7 +778,7 @@ function AuiManhuntApp() {
   const walkieTickTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const playedWalkieIdsRef = useRef<Set<string>>(new Set());
   const playedTauntIdsRef = useRef<Set<string>>(new Set());
-  const walkiePlayerRef = useRef<HTMLAudioElement | null>(null);
+  const walkieAudioRef = useRef<HTMLAudioElement | null>(null);
   const walkieAudioUnlockedRef = useRef<boolean>(false);
   const lastPlayedClipIdRef = useRef<string | null>(null);
   const lastPlayedRadioCalloutIdRef = useRef<string | null>(null);
@@ -929,18 +982,18 @@ function AuiManhuntApp() {
   const unlockAudioHardware = useCallback(() => {
     soundEngine.unlockAndPlayActivationChime();
     setSoundUnlockedLocal(true);
-    if (walkiePlayerRef.current && !walkieAudioUnlockedRef.current) {
+    if (walkieAudioRef.current && !walkieAudioUnlockedRef.current) {
       try {
-        walkiePlayerRef.current.src =
+        walkieAudioRef.current.src =
           'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
-        walkiePlayerRef.current.volume = 1.0;
-        const playPromise = walkiePlayerRef.current.play();
+        walkieAudioRef.current.volume = 1.0;
+        const playPromise = walkieAudioRef.current.play();
         if (playPromise !== undefined) {
           playPromise
             .then(() => {
               walkieAudioUnlockedRef.current = true;
-              walkiePlayerRef.current?.pause();
-              if (walkiePlayerRef.current) walkiePlayerRef.current.currentTime = 0;
+              walkieAudioRef.current?.pause();
+              if (walkieAudioRef.current) walkieAudioRef.current.currentTime = 0;
             })
             .catch(() => {});
         }
@@ -987,9 +1040,9 @@ function AuiManhuntApp() {
 
       if (clip.audioDataUrl && clip.audioDataUrl.startsWith('data:audio')) {
         let played = false;
-        if (walkiePlayerRef.current) {
+        if (walkieAudioRef.current) {
           try {
-            const el = walkiePlayerRef.current;
+            const el = walkieAudioRef.current;
             el.src = clip.audioDataUrl;
             el.volume = 1.0;
             const anyAudio = el as HTMLAudioElement & {
@@ -1001,7 +1054,7 @@ function AuiManhuntApp() {
               anyAudio.preservesPitch = false;
               anyAudio.mozPreservesPitch = false;
               anyAudio.webkitPreservesPitch = false;
-              el.playbackRate = 0.78;
+              el.playbackRate = 0.88;
             } else {
               anyAudio.preservesPitch = true;
               el.playbackRate = 1.0;
@@ -1373,14 +1426,20 @@ function AuiManhuntApp() {
     const inClearGrace = Date.now() < gpsClearGraceUntilRef.current;
     if (rawSnap.latestVoiceClip?.audioDataUrl) {
       lastRadioAudioRef.current = {
+        id: rawSnap.latestVoiceClip.id,
         audioDataUrl: rawSnap.latestVoiceClip.audioDataUrl,
         voiceText: rawSnap.latestVoiceClip.voiceText,
         disguised: rawSnap.latestVoiceClip.disguised,
+        senderName: rawSnap.latestVoiceClip.senderNickname,
+        senderRole: rawSnap.latestVoiceClip.senderRole,
       };
     } else if (rawSnap.latestVoiceClip?.voiceText) {
       lastRadioAudioRef.current = {
+        id: rawSnap.latestVoiceClip.id,
         voiceText: rawSnap.latestVoiceClip.voiceText,
         disguised: rawSnap.latestVoiceClip.disguised,
+        senderName: rawSnap.latestVoiceClip.senderNickname,
+        senderRole: rawSnap.latestVoiceClip.senderRole,
       };
     }
     return {
@@ -1388,7 +1447,10 @@ function AuiManhuntApp() {
       viewerGpsDenied: inClearGrace ? false : rawSnap.viewerGpsDenied,
       viewerGpsConsent: inClearGrace ? true : rawSnap.viewerGpsConsent,
       latestVoiceClip: rawSnap.latestVoiceClip
-        ? { ...rawSnap.latestVoiceClip, audioDataUrl: undefined }
+        ? {
+            ...rawSnap.latestVoiceClip,
+            audioDataUrl: rawSnap.latestVoiceClip.audioDataUrl || lastRadioAudioRef.current?.audioDataUrl,
+          }
         : rawSnap.latestVoiceClip,
       participants: rawSnap.participants.map((p: ParticipantView) => {
         let nextPr = p.photoRequest;
@@ -1607,6 +1669,13 @@ function AuiManhuntApp() {
         content: clip.voiceText || '',
         audioDataUrl: clip.audioDataUrl,
       });
+      showRadioToast({
+        id: clip.id,
+        senderName: clip.senderNickname,
+        text: clip.voiceText || '',
+        hasAudio: Boolean(clip.audioDataUrl || clip.hasAudio),
+        audioDataUrl: clip.audioDataUrl,
+      });
 
       lastRadioAudioRef.current = {
         id: clip.id,
@@ -1633,6 +1702,12 @@ function AuiManhuntApp() {
         type: 'TTS',
         content: callout.text,
       });
+      showRadioToast({
+        id: callout.id,
+        senderName: callout.senderName,
+        text: callout.text,
+        hasAudio: false,
+      });
       lastRadioAudioRef.current = {
         id: callout.id,
         voiceText: callout.text,
@@ -1641,41 +1716,40 @@ function AuiManhuntApp() {
         senderRole: callout.senderRole,
       };
 
-      if (callout.senderId !== activePlayerId) {
-        playedSpecificAlertThisCycle = true;
-        soundEngine.playRadioSquelch('START');
-        setActiveWalkieSpeaker({
-          nickname: callout.senderName,
-          role: callout.senderRole || 'PLAYER',
-          disguised: callout.disguised,
-          voiceText: callout.text,
-        });
-        if ('speechSynthesis' in window) {
-          try {
-            window.speechSynthesis.cancel();
-            const utter = new SpeechSynthesisUtterance(callout.text);
-            utter.lang = 'en-US';
-            utter.rate = 1.05;
-            utter.pitch = callout.disguised ? 0.6 : 1.0;
-            utter.volume = 1.0;
-            utter.onend = () => {
-              soundEngine.playRadioSquelch('END');
-              setActiveWalkieSpeaker((prev) => (prev && prev.nickname === callout.senderName ? null : prev));
-            };
-            utter.onerror = () => {
-              soundEngine.playRadioSquelch('END');
-              setActiveWalkieSpeaker((prev) => (prev && prev.nickname === callout.senderName ? null : prev));
-            };
-            window.speechSynthesis.speak(utter);
-          } catch {
+      playedSpecificAlertThisCycle = true;
+      soundEngine.playRadioSquelch('START');
+      setActiveWalkieSpeaker({
+        nickname: callout.senderName,
+        role: callout.senderRole || 'PLAYER',
+        disguised: callout.disguised,
+        voiceText: callout.text,
+      });
+
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        try {
+          window.speechSynthesis.cancel();
+          const utter = new SpeechSynthesisUtterance(callout.text);
+          utter.lang = 'en-US';
+          utter.rate = 1.05;
+          utter.pitch = callout.disguised ? 0.6 : 1.0;
+          utter.volume = 1.0;
+          utter.onend = () => {
             soundEngine.playRadioSquelch('END');
             setActiveWalkieSpeaker((prev) => (prev && prev.nickname === callout.senderName ? null : prev));
-          }
-        } else {
-          soundEngine.playSilentRadioTTS(callout.text, callout.disguised, () => {
+          };
+          utter.onerror = () => {
+            soundEngine.playRadioSquelch('END');
             setActiveWalkieSpeaker((prev) => (prev && prev.nickname === callout.senderName ? null : prev));
-          });
+          };
+          window.speechSynthesis.speak(utter);
+        } catch {
+          soundEngine.playRadioSquelch('END');
+          setActiveWalkieSpeaker((prev) => (prev && prev.nickname === callout.senderName ? null : prev));
         }
+      } else {
+        soundEngine.playSilentRadioTTS(callout.text, callout.disguised, () => {
+          setActiveWalkieSpeaker((prev) => (prev && prev.nickname === callout.senderName ? null : prev));
+        });
       }
     }
 
@@ -1687,31 +1761,31 @@ function AuiManhuntApp() {
           playedSpecificAlertThisCycle = true;
           const meta = TAUNT_OPTIONS.find((t) => t.type === taunt.tauntType);
           const roleLabel = taunt.senderRole || 'Player';
+
+          soundEngine.playRadioSquelch('START');
           soundEngine.playTauntSound(taunt.tauntType);
           showToast(
             `${meta?.emoji || '📣'} [${taunt.senderNickname} - ${roleLabel}]: ${meta?.label || taunt.tauntType}`,
             'warning'
           );
 
-          if (taunt.senderId !== activePlayerId) {
-            const tauntSpeechMap: Record<TauntType, string> = {
-              CATCH_ME: 'Catch me if you can!',
-              I_SEE_YOU: 'I see you!',
-              AIRHORN: 'Airhorn!',
-              TOO_SLOW: 'Too slow!',
-            };
-            const speechText = tauntSpeechMap[taunt.tauntType] || meta?.label || 'Taunt!';
-            if ('speechSynthesis' in window) {
-              try {
-                window.speechSynthesis.cancel();
-                const utter = new SpeechSynthesisUtterance(speechText);
-                utter.lang = 'en-US';
-                utter.rate = 1.1;
-                utter.pitch = 1.2;
-                utter.volume = 1.0;
-                window.speechSynthesis.speak(utter);
-              } catch {}
-            }
+          const tauntSpeechMap: Record<TauntType, string> = {
+            CATCH_ME: 'Catch me if you can!',
+            I_SEE_YOU: 'I see you!',
+            AIRHORN: 'Airhorn!',
+            TOO_SLOW: 'Too slow!',
+          };
+          const speechText = tauntSpeechMap[taunt.tauntType] || meta?.label || 'Taunt!';
+          if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+            try {
+              window.speechSynthesis.cancel();
+              const utter = new SpeechSynthesisUtterance(speechText);
+              utter.lang = 'en-US';
+              utter.rate = 1.1;
+              utter.pitch = 1.2;
+              utter.volume = 1.0;
+              window.speechSynthesis.speak(utter);
+            } catch {}
           }
         }
       }
@@ -2205,11 +2279,16 @@ function AuiManhuntApp() {
         setLocalGpsFix(fix);
         setLastGpsError(null);
 
-        const intervalMs = (latestStateRef.current.snapshot?.settings.gpsIntervalSeconds || GPS_UPDATE_INTERVAL_SECONDS) * 1000;
+        const isGameRunning =
+          latestStateRef.current.snapshot?.state === 'ACTIVE' ||
+          latestStateRef.current.snapshot?.state === 'COUNTDOWN';
+        const intervalMs = isGameRunning
+          ? 10000
+          : (latestStateRef.current.snapshot?.settings.gpsIntervalSeconds || GPS_UPDATE_INTERVAL_SECONDS) * 1000;
         const hasServerLoc = Boolean(
           latestStateRef.current.snapshot?.participants.find((p) => p.id === expectedPlayerId)?.location
         );
-        // Immediately sync to server if player has no location yet or if the room's GPS interval has elapsed
+        // Automatically sync to server every 10s during match so player pins never go stale
         if (!hasServerLoc || now - lastGpsSubmitAtRef.current >= intervalMs - 1000) {
           submitGpsCoordsToServer(
             expectedCode,
@@ -2252,8 +2331,9 @@ function AuiManhuntApp() {
 
     if (!me.location) triggerForegroundGpsUpdate(false);
 
-    // 2. Periodic server sync timer according to room's gpsIntervalSeconds
-    const intervalMs = (snapshot.settings.gpsIntervalSeconds || GPS_UPDATE_INTERVAL_SECONDS) * 1000;
+    // 2. Periodic server sync timer (every 10s during active match to keep pins live)
+    const isGameRunning = snapshot.state === 'ACTIVE' || snapshot.state === 'COUNTDOWN';
+    const intervalMs = isGameRunning ? 10000 : (snapshot.settings.gpsIntervalSeconds || GPS_UPDATE_INTERVAL_SECONDS) * 1000;
     if (gpsIntervalRef.current !== null) {
       clearInterval(gpsIntervalRef.current);
     }
@@ -2742,17 +2822,20 @@ function AuiManhuntApp() {
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false,
+      });
       walkieStreamRef.current = stream;
       walkieChunksRef.current = [];
       walkieStartMsRef.current = Date.now();
 
-      let options: MediaRecorderOptions = { audioBitsPerSecond: 24000 };
+      let options: MediaRecorderOptions = { audioBitsPerSecond: 64000 };
       if (typeof MediaRecorder.isTypeSupported === 'function') {
         if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-          options = { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 24000 };
+          options = { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 64000 };
         } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
-          options = { mimeType: 'audio/mp4', audioBitsPerSecond: 24000 };
+          options = { mimeType: 'audio/mp4', audioBitsPerSecond: 64000 };
         }
       }
 
@@ -2766,7 +2849,7 @@ function AuiManhuntApp() {
       };
 
       recorder.onstop = () => {
-        const durSec = Math.max(0.6, Math.min(6, (Date.now() - walkieStartMsRef.current) / 1000));
+        const durSec = Math.max(0.6, Math.min(4, (Date.now() - walkieStartMsRef.current) / 1000));
         const mimeType = recorder.mimeType || 'audio/webm';
         const blob = new Blob(walkieChunksRef.current, { type: mimeType });
         cleanupWalkieRecorder();
@@ -2797,9 +2880,19 @@ function AuiManhuntApp() {
               content: '',
               audioDataUrl: base64Url,
             });
+            showRadioToast({
+              id: res.messageId,
+              senderName: me?.nickname || 'You',
+              text: 'Voice Transmission Sent',
+              hasAudio: true,
+              audioDataUrl: base64Url,
+            });
             lastRadioAudioRef.current = {
+              id: res.messageId,
               audioDataUrl: base64Url,
               disguised: walkieDisguised,
+              senderName: me?.nickname || 'You',
+              senderRole: isHunter ? 'HUNTER' : 'HIDER',
             };
             soundEngine.playRadioSquelch('END');
           }
@@ -2812,7 +2905,7 @@ function AuiManhuntApp() {
       setWalkieRecordingSeconds(0);
 
       walkieTickTimerRef.current = setInterval(() => {
-        const elapsed = Math.min(6, Math.floor((Date.now() - walkieStartMsRef.current) / 1000));
+        const elapsed = Math.min(4, Math.floor((Date.now() - walkieStartMsRef.current) / 1000));
         setWalkieRecordingSeconds(elapsed);
       }, 250);
 
@@ -2820,7 +2913,7 @@ function AuiManhuntApp() {
         if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
           mediaRecorderRef.current.stop();
         }
-      }, 6000);
+      }, 4000);
     } catch {
       cleanupWalkieRecorder();
       // Fallback synthesized radio voice clip if microphone permission was blocked
@@ -2870,6 +2963,12 @@ function AuiManhuntApp() {
         senderName: me?.nickname || 'You',
         type: 'TTS',
         content: textToSend,
+      });
+      showRadioToast({
+        id: res.messageId,
+        senderName: me?.nickname || 'You',
+        text: textToSend,
+        hasAudio: false,
       });
       lastRadioAudioRef.current = {
         voiceText: textToSend,
@@ -3173,7 +3272,11 @@ function AuiManhuntApp() {
   const isHunterMapLocked = Boolean(isHunter && isHidingCountdown);
   const unifiedGpsIntervalSec = snapshot?.settings.gpsIntervalSeconds || GPS_UPDATE_INTERVAL_SECONDS;
   const effectiveGpsAccuracy = me?.location?.accuracy ?? localGpsFix?.accuracy ?? null;
-  const effectiveGpsStale = Boolean(me?.location?.isStale);
+  const effectiveGpsAgeSeconds = me?.location?.updatedAt
+    ? Math.max(0, Math.round((nowTick - me.location.updatedAt) / 1000))
+    : me?.location?.ageSeconds ??
+      (localGpsFix?.updatedAt ? Math.max(0, Math.round((nowTick - localGpsFix.updatedAt) / 1000)) : 0);
+  const effectiveGpsStale = effectiveGpsAgeSeconds > 25;
 
   // Mathematical distance check between player location and green circle center
   const myDistanceFromCenterMeters =
@@ -3211,7 +3314,10 @@ function AuiManhuntApp() {
         const ageSeconds = p.location!.updatedAt
           ? Math.max(0, Math.round((nowTick - p.location!.updatedAt) / 1000))
           : p.location!.ageSeconds;
-        const staleThreshold = Math.max(45, (snapshot.settings.gpsIntervalSeconds || 60) + 15);
+        const staleThreshold =
+          snapshot.state === 'ACTIVE' || snapshot.state === 'COUNTDOWN'
+            ? 25
+            : Math.max(45, (snapshot.settings.gpsIntervalSeconds || 60) + 15);
         return {
           id: p.id,
           nickname: p.nickname,
@@ -3351,7 +3457,7 @@ function AuiManhuntApp() {
       if (prox?.nearby && localGpsAccuracyOk) {
         if (vis === 'HIDDEN') {
           return {
-            label: '⚠️ حذر: يوجد صياد قريب منك!',
+            label: '⚠️ Hunter Nearby! (Stealth Radar)',
             tone: prox.distanceBand === 'CRITICAL' ? ('critical' as const) : ('warning' as const),
           };
         }
@@ -3686,8 +3792,8 @@ function AuiManhuntApp() {
                     onClick={() => applyQuickModePreset('stealth')}
                     className={`p-4 rounded-2xl border text-left transition flex flex-col justify-between ${
                       selectedPresetId === 'stealth'
-                        ? 'bg-purple-50 border-purple-700 shadow-sm ring-2 ring-purple-700/20'
-                        : 'bg-canvas border-stoneline hover:border-purple-700/50'
+                        ? 'bg-stone-100 border-stone-800 shadow-sm ring-2 ring-stone-800/20'
+                        : 'bg-canvas border-stoneline hover:border-stone-800/50'
                     }`}
                   >
                     <div>
@@ -3696,7 +3802,7 @@ function AuiManhuntApp() {
                           <span>🕵️</span> Stealth &amp; Shadows
                         </span>
                         {selectedPresetId === 'stealth' && (
-                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-purple-800 text-white">Selected</span>
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-stone-900 text-white">Selected</span>
                         )}
                       </div>
                       <p className="text-[11px] text-ink-secondary leading-snug">
@@ -4271,7 +4377,7 @@ function AuiManhuntApp() {
                     <summary className="w-full flex items-center justify-between p-3 rounded-xl bg-canvas border border-stoneline hover:bg-canvas-subtle transition-colors text-left cursor-pointer list-none">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-xs font-bold text-cedar uppercase tracking-wider flex items-center gap-1.5">
-                          ⚙️ إعدادات اللعبة المتقدمة (Host Settings)
+                          ⚙️ Host Game Settings
                         </span>
                         {lobbySettingsSaveStatus === 'saving' && (
                           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-50 text-amber-800 border border-amber-200">
@@ -4683,34 +4789,36 @@ function AuiManhuntApp() {
                 </div>
               )}
 
-              {activeWalkieSpeaker && (
-                <div
-                  style={{ backgroundColor: '#1e1b4b', color: '#ffffff' }}
-                  className="p-3.5 rounded-2xl bg-indigo-950 text-white border-2 border-indigo-400 shadow-lg flex items-center justify-between gap-3 animate-pulse"
-                >
-                  <div className="flex items-center gap-3">
-                    <span className="text-2xl shrink-0">📻</span>
-                    <div>
-                      <strong className="font-display font-extrabold text-sm sm:text-base text-white block">
-                        Incoming Walkie-Talkie from {activeWalkieSpeaker.nickname} ({activeWalkieSpeaker.role})
-                      </strong>
-                      <span className="text-xs text-indigo-200 font-medium">
-                        {activeWalkieSpeaker.voiceText ? `"${activeWalkieSpeaker.voiceText}" • ` : ''}
-                        {activeWalkieSpeaker.disguised ? '🕵️ Voice Disguise Active • Live Radio Channel' : 'Live Campus Radio Transmission'}
-                      </span>
+              {/* Dismissible Floating Radio Toast Notification */}
+              {radioToast && (
+                <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[9999] w-[94%] max-w-md bg-stone-900/95 backdrop-blur-md text-white px-4 py-2.5 rounded-2xl shadow-xl border border-stone-700/70 flex items-center justify-between gap-3 animate-in fade-in slide-in-from-top duration-200">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span className="text-xl shrink-0">📻</span>
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold truncate">
+                        {radioToast.senderName}
+                      </div>
+                      <div className="text-[11px] text-stone-300 truncate">
+                        {radioToast.text ? `"${radioToast.text}"` : radioToast.hasAudio ? '🔊 Voice Message' : 'Radio Transmission'}
+                      </div>
                     </div>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
+                  <div className="flex items-center gap-1.5 shrink-0">
                     <button
                       type="button"
                       onClick={handleReplayLastRadioMessage}
-                      className="px-3 py-1.5 rounded-xl bg-indigo-800 hover:bg-indigo-700 text-white font-bold text-xs flex items-center gap-1.5 transition-all shadow-sm"
+                      className="px-2.5 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white font-semibold text-xs flex items-center gap-1"
                     >
-                      🔊 Play / Replay
+                      <span>🔊 Play</span>
                     </button>
-                    <span className="px-2.5 py-1 rounded-full bg-indigo-600 text-white font-mono text-[11px] font-bold uppercase shrink-0">
-                      ON AIR
-                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setRadioToast(null)}
+                      className="w-7 h-7 rounded-lg hover:bg-stone-800 text-stone-400 hover:text-white flex items-center justify-center text-sm font-bold"
+                      aria-label="Close radio notification"
+                    >
+                      ✕
+                    </button>
                   </div>
                 </div>
               )}
@@ -4725,7 +4833,7 @@ function AuiManhuntApp() {
                     <div>
                       <strong className="font-display font-extrabold text-base sm:text-lg text-white block uppercase tracking-wide">
                         {snapshot.settings.hunterVisibilityMode === 'HIDDEN'
-                          ? '⚠️ حذر: يوجد صياد قريب منك!'
+                          ? 'Hunter Nearby! (Stealth Radar)'
                           : snapshot.hunterProximity.distanceBand === 'CRITICAL'
                           ? 'Hunter Nearby! (Danger Close)'
                           : 'Hunter Nearby! (Approaching)'}
@@ -4806,153 +4914,115 @@ function AuiManhuntApp() {
                 </div>
               )}
 
-              {/* Sticky Status Bar */}
-              <div className="sticky top-14 z-30 aui-card p-2.5 sm:px-4 shadow-md bg-canvas/95 backdrop-blur-sm flex flex-col gap-2">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className={`px-3 py-1.5 rounded-xl font-display font-bold text-xs text-white ${isHunter ? 'bg-hunter' : 'bg-cedar'}`}>
-                      {isHunter ? 'HUNTER' : 'HIDER'}
-                    </span>
-                    <SmoothCountdownHeaderTicker
-                      state={snapshot.state}
-                      headStartEndsAtMs={snapshot.headStartEndsAtMs}
-                      gameEndsAtMs={snapshot.gameEndsAtMs}
-                      pausedRemainingMs={snapshot.pausedRemainingMs}
-                      fallbackCountdownSeconds={snapshot.countdownSecondsLeft}
-                      fallbackGameSeconds={snapshot.gameSecondsLeft}
-                      serverTimeOffsetMs={serverTimeOffsetMs}
-                      onCountdownZero={handleCountdownReachedZero}
-                    />
+              {/* Compact Single-Row HUD - Completely separated from the map with mb-3 */}
+              <div className="bg-white border border-stone-200/80 shadow-sm rounded-2xl px-4 py-2.5 mb-3 flex items-center justify-between gap-2 select-none">
+                {/* Left: Role Badge + Timer + Unified Honest Dynamic GPS Indicator */}
+                <div className="flex items-center gap-2 min-w-0">
+                  <span
+                    className={`px-2.5 py-1 rounded-xl font-display font-bold text-xs text-white shrink-0 ${
+                      isHunter ? 'bg-rose-600' : 'bg-emerald-800'
+                    }`}
+                  >
+                    {isHunter ? 'HUNTER' : 'HIDER'}
+                  </span>
+                  <SmoothCountdownHeaderTicker
+                    state={snapshot.state}
+                    headStartEndsAtMs={snapshot.headStartEndsAtMs}
+                    gameEndsAtMs={snapshot.gameEndsAtMs}
+                    pausedRemainingMs={snapshot.pausedRemainingMs}
+                    fallbackCountdownSeconds={snapshot.countdownSecondsLeft}
+                    fallbackGameSeconds={snapshot.gameSecondsLeft}
+                    serverTimeOffsetMs={serverTimeOffsetMs}
+                    onCountdownZero={handleCountdownReachedZero}
+                  />
 
-                    {/* GPS Status Pill */}
+                  {/* Unified Honest Dynamic GPS Indicator */}
+                  <span
+                    className={`px-2 py-0.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 shrink-0 ${
+                      isGpsDenied
+                        ? 'bg-rose-50 text-rose-700 border border-rose-200'
+                        : !isOnline
+                        ? 'bg-stone-100 text-stone-600 border border-stone-200'
+                        : effectiveGpsAccuracy !== null
+                        ? effectiveGpsStale
+                          ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                          : 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                        : 'bg-stone-100 text-stone-600 border border-stone-200'
+                    }`}
+                  >
                     <span
-                      className={`px-2.5 py-1 rounded-xl text-xs font-semibold flex items-center gap-1.5 ${
-                        isGpsActiveAndConsented
-                          ? 'bg-emerald-100 text-emerald-900 border border-emerald-300'
-                          : isGpsDenied
-                          ? 'bg-red-100 text-red-900 border border-red-300'
-                          : 'bg-amber-100 text-amber-900 border border-amber-300'
+                      className={`w-1.5 h-1.5 rounded-full ${
+                        isGpsDenied
+                          ? 'bg-rose-600'
+                          : !isOnline
+                          ? 'bg-stone-400'
+                          : effectiveGpsAccuracy !== null
+                          ? effectiveGpsStale
+                            ? 'bg-amber-500'
+                            : 'bg-emerald-600 animate-pulse'
+                          : 'bg-stone-400 animate-pulse'
                       }`}
-                    >
-                      <span
-                        className={`w-2 h-2 rounded-full ${
-                          isGpsActiveAndConsented ? 'bg-emerald-600 animate-pulse' : isGpsDenied ? 'bg-red-600' : 'bg-amber-600'
-                        }`}
-                      />
-                      <span>{isGpsActiveAndConsented ? 'GPS Live' : isGpsDenied ? 'GPS Denied' : 'GPS Waiting'}</span>
+                    />
+                    <span className="text-[11px]">
+                      {isGpsDenied
+                        ? 'GPS Blocked'
+                        : !isOnline
+                        ? 'Offline'
+                        : effectiveGpsAccuracy !== null
+                        ? effectiveGpsStale
+                          ? `GPS ±${effectiveGpsAccuracy}m (${effectiveGpsAgeSeconds}s)`
+                          : `GPS ±${effectiveGpsAccuracy}m`
+                        : 'Locating...'}
                     </span>
+                  </span>
 
-                    {/* Nearest Target / Radar Status Pill */}
-                    {nearestTargetInfo && (
-                      <span
-                        className={`px-2.5 py-1 rounded-xl text-xs font-bold flex items-center gap-1.5 transition ${
-                          nearestTargetInfo.tone === 'critical'
-                            ? 'bg-red-950 text-red-100 border border-red-500 animate-pulse'
-                            : nearestTargetInfo.tone === 'warning' || nearestTargetInfo.tone === 'near'
-                            ? 'bg-amber-900 text-amber-100 border border-amber-500'
-                            : nearestTargetInfo.tone === 'safe'
-                            ? 'bg-emerald-950 text-emerald-100 border border-emerald-500'
-                            : 'bg-stone-800 text-stone-200 border border-stone-600'
-                        }`}
-                      >
-                        <span>{nearestTargetInfo.label}</span>
-                      </span>
-                    )}
-                  </div>
-
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <div className="text-right mr-1">
-                      <span className="text-[10px] uppercase tracking-wider text-ink-muted block font-semibold">Hiders free</span>
-                      <span className="font-display font-bold text-sm text-ink">
-                        {snapshot.activeHiders} of {snapshot.totalHiders}
-                      </span>
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={handleUnlockAudio}
-                      className={`min-h-[40px] px-3 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1.5 ${
-                        isSoundActive
-                          ? 'bg-emerald-700 hover:bg-emerald-800 text-white shadow-sm'
-                          : 'bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300'
+                  {/* Nearest Target / Radar Alert */}
+                  {nearestTargetInfo && (
+                    <span
+                      className={`hidden sm:inline-flex px-2 py-0.5 rounded-lg text-xs font-bold items-center gap-1 shrink-0 ${
+                        nearestTargetInfo.tone === 'critical'
+                          ? 'bg-rose-100 text-rose-800 border border-rose-300 animate-pulse'
+                          : nearestTargetInfo.tone === 'warning' || nearestTargetInfo.tone === 'near'
+                          ? 'bg-amber-100 text-amber-800 border border-amber-300'
+                          : 'bg-emerald-100 text-emerald-800 border border-emerald-300'
                       }`}
                     >
-                      <span className={`w-2 h-2 rounded-full ${isSoundActive ? 'bg-emerald-300' : 'bg-amber-600'}`} />
-                      <span>{isSoundActive ? 'Sound Active 🔊' : 'Enable Sound'}</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={handleTestSound}
-                      className="btn-secondary min-h-[40px] px-2.5 py-1.5 rounded-xl text-xs font-semibold"
-                    >
-                      Test
-                    </button>
-                  </div>
+                      <span>{nearestTargetInfo.label}</span>
+                    </span>
+                  )}
                 </div>
 
-                {/* Hider Catch PIN & Active Ghost Cloak Badge */}
-                {!isHunter && me?.status === 'ACTIVE' && (
-                  <div className="pt-1.5 border-t border-stoneline flex flex-wrap items-center justify-between gap-2 text-xs">
-                    <div className="flex flex-wrap items-center gap-2">
-                      {catchMode === 'CATCH_PIN' && snapshot.viewerCatchPin && (
-                        <div className="px-3 py-1 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 flex items-center gap-2">
-                          <span className="font-semibold">🔐 Your Catch PIN:</span>
-                          <span className="font-mono font-extrabold text-base tracking-widest text-hunter">
-                            {snapshot.viewerCatchPin}
-                          </span>
-                        </div>
-                      )}
-                      {snapshot.settings.teammateVisibility === 'HIDE_TEAMMATES' && (
-                        <span className="px-2.5 py-1 rounded-lg bg-stone-200 text-stone-800 font-semibold text-[11px]">
-                          🌫️ Fog of War Active
-                        </span>
-                      )}
-                    </div>
-
-                    {(() => {
-                      const cloakUntil = snapshot.viewerGhostCloak?.activeUntilMs || 0;
-                      const cloakLeft = cloakUntil > nowTick
-                        ? Math.max(0, Math.ceil((cloakUntil - nowTick) / 1000))
-                        : snapshot.viewerGhostCloak?.active
-                        ? snapshot.viewerGhostCloak.secondsLeft
-                        : 0;
-                      const cloakActive = cloakLeft > 0;
-                      const cloakUsed = Boolean(snapshot.viewerGhostCloak?.used);
-                      return (
-                        <div className="ml-auto flex items-center gap-2">
-                          {cloakActive ? (
-                            <span className="px-3 py-1 rounded-xl bg-purple-900 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm animate-pulse">
-                              <span>👻 Ghost Cloak Active ({cloakLeft}s left)</span>
-                            </span>
-                          ) : !cloakUsed ? (
-                            <button
-                              type="button"
-                              disabled={snapshot.state !== 'ACTIVE' || me?.status !== 'ACTIVE'}
-                              onClick={() => {
-                                soundEngine.playGhostCloakTone();
-                                dispatchGameAction({ action: 'ACTIVATE_GHOST_CLOAK' }, '👻 Ghost Cloak Activated for 60s!');
-                              }}
-                              className="min-h-[36px] px-3 py-1 rounded-xl bg-purple-800 hover:bg-purple-900 text-white font-bold text-xs disabled:opacity-40"
-                            >
-                              👻 Activate Ghost Cloak
-                            </button>
-                          ) : (
-                            <span className="px-3 py-1 rounded-xl bg-stone-200 text-stone-700 font-semibold text-xs">
-                              👻 Ghost Cloak used
-                            </span>
-                          )}
-                        </div>
-                      );
-                    })()}
+                {/* Right: Active Hiders Count + Audio Toggle */}
+                <div className="flex items-center gap-2 shrink-0">
+                  <div className="text-right">
+                    <span className="text-[10px] uppercase tracking-wider text-stone-500 block font-semibold leading-none">
+                      Hiders
+                    </span>
+                    <span className="font-bold text-xs sm:text-sm text-stone-900 leading-tight">
+                      {snapshot.activeHiders} / {snapshot.totalHiders}
+                    </span>
                   </div>
-                )}
+
+                  <button
+                    type="button"
+                    onClick={handleUnlockAudio}
+                    className={`h-8 px-2.5 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 ${
+                      isSoundActive
+                        ? 'bg-emerald-800 hover:bg-emerald-700 text-white shadow-sm'
+                        : 'bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300'
+                    }`}
+                    title="Toggle Audio"
+                  >
+                    <span className={`w-1.5 h-1.5 rounded-full ${isSoundActive ? 'bg-emerald-300' : 'bg-amber-600'}`} />
+                    <span>{isSoundActive ? '🔊 Audio' : '🔇 Audio'}</span>
+                  </button>
+                </div>
               </div>
 
               {/* Map Container */}
               <div
                 style={{ position: 'relative', zIndex: 1, isolation: 'isolate' }}
-                className="map-stack-container relative w-full h-[52vh] sm:h-[60vh] min-h-[340px] rounded-2xl overflow-hidden border border-stoneline shadow-sm bg-[#EBF1EC]"
+                className="map-stack-container relative w-full h-[52vh] sm:h-[60vh] min-h-[340px] rounded-2xl overflow-hidden border border-stone-200/80 shadow-sm bg-[#EBF1EC]"
               >
                 {isHunterMapLocked ? (
                   <HunterLockedMapCountdownOverlay
@@ -4968,43 +5038,7 @@ function AuiManhuntApp() {
                     markers={mapMarkers}
                     centerCommand={gameCenterCmd}
                     fitBoundaryCommand={fitBoundaryCmd}
-                  />
-                )}
-
-                <div className="absolute top-3 left-3 z-[400] flex flex-col gap-1.5 max-w-[68%]">
-                  <div className="aui-pill px-3 py-1.5 rounded-xl text-xs flex items-center gap-2">
-                    <span className="font-bold text-ink truncate">
-                      {!isOnline
-                        ? '🔴 Offline — GPS paused'
-                        : isGpsDenied
-                        ? '🔴 GPS Blocked'
-                        : !snapshot.viewerGpsConsent
-                        ? '🟡 Tap Allow GPS Sharing'
-                        : effectiveGpsAccuracy !== null && !effectiveGpsStale && !lastGpsError
-                        ? effectiveGpsAccuracy <= 20
-                          ? `🟢 GPS Strong (±${effectiveGpsAccuracy}m)`
-                          : `🟡 GPS Fair (±${effectiveGpsAccuracy}m)`
-                        : effectiveGpsAccuracy !== null && effectiveGpsStale
-                        ? `🟡 GPS Stale (±${effectiveGpsAccuracy}m)`
-                        : gpsInFlight
-                        ? '🔄 Searching GPS...'
-                        : lastGpsError
-                        ? `🔄 ${lastGpsError}`
-                        : '🔄 Searching GPS...'}
-                    </span>
-                    {me?.location && (
-                      <span className="text-ink-muted font-mono text-[11px] shrink-0">
-                        • {me.location.updatedAt ? Math.max(0, Math.round((nowTick - me.location.updatedAt) / 1000)) : me.location.ageSeconds}s
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                <div className="absolute top-3 right-3 z-[400] flex flex-col gap-2">
-                  <button
-                    type="button"
-                    disabled={isHunterMapLocked}
-                    onClick={() => {
+                    onCenterMe={() => {
                       if (me?.location) {
                         setGameCenterCmd({ lat: me.location.lat, lng: me.location.lng, zoom: 17, ts: Date.now() });
                       } else if (localGpsFix) {
@@ -5013,27 +5047,9 @@ function AuiManhuntApp() {
                         showToast('Your GPS position is not active yet.', 'warning');
                       }
                     }}
-                    className="aui-pill min-h-[40px] px-3 py-1.5 rounded-xl text-xs font-semibold text-ink hover:bg-white disabled:opacity-45 disabled:cursor-not-allowed"
-                  >
-                    Center map
-                  </button>
-                  <button
-                    type="button"
-                    disabled={isHunterMapLocked}
-                    onClick={() => setFitBoundaryCmd(Date.now())}
-                    className="aui-pill min-h-[40px] px-3 py-1.5 rounded-xl text-xs font-semibold text-ink hover:bg-white disabled:opacity-45 disabled:cursor-not-allowed"
-                  >
-                    Play area
-                  </button>
-                  <button
-                    type="button"
-                    disabled={isGpsDenied}
-                    onClick={() => triggerForegroundGpsUpdate(true)}
-                    className="aui-pill min-h-[40px] px-3 py-1.5 rounded-xl text-xs font-semibold text-cedar hover:bg-white disabled:opacity-45 disabled:cursor-not-allowed disabled:pointer-events-none"
-                  >
-                    Update GPS
-                  </button>
-                </div>
+                    onFitBoundary={() => setFitBoundaryCmd(Date.now())}
+                  />
+                )}
               </div>
 
               {/* Segmented Tools & Activities Card */}
@@ -5094,8 +5110,66 @@ function AuiManhuntApp() {
                       {/* TAB 1: RADIO & TOOLS */}
                       {effectiveTab === 'radio' && isRadioEnabled && (
                         <div className="space-y-3">
+                          {/* Hider Covert Tactical Bar (Ghost Cloak & Catch PIN) */}
+                          {!isHunter && me?.status === 'ACTIVE' && (
+                            <div className="p-3.5 rounded-xl bg-stone-50 border border-stone-200/80 flex flex-wrap items-center justify-between gap-2.5">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                {catchMode === 'CATCH_PIN' && snapshot.viewerCatchPin && (
+                                  <div className="px-3 py-1 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 flex items-center gap-1.5">
+                                    <span className="text-xs font-semibold">🔐 Catch PIN:</span>
+                                    <span className="font-mono font-extrabold text-sm tracking-wider text-rose-600">
+                                      {snapshot.viewerCatchPin}
+                                    </span>
+                                  </div>
+                                )}
+                                {snapshot.settings.teammateVisibility === 'HIDE_TEAMMATES' && (
+                                  <span className="px-2.5 py-1 rounded-lg bg-stone-200 text-stone-800 font-semibold text-[11px]">
+                                    🌫️ Fog of War
+                                  </span>
+                                )}
+                              </div>
+
+                              {(() => {
+                                const cloakUntil = snapshot.viewerGhostCloak?.activeUntilMs || 0;
+                                const cloakLeft = cloakUntil > nowTick
+                                  ? Math.max(0, Math.ceil((cloakUntil - nowTick) / 1000))
+                                  : snapshot.viewerGhostCloak?.active
+                                  ? snapshot.viewerGhostCloak.secondsLeft
+                                  : 0;
+                                const cloakActive = cloakLeft > 0;
+                                const cloakUsed = Boolean(snapshot.viewerGhostCloak?.used);
+
+                                return (
+                                  <div className="flex items-center gap-2">
+                                    {cloakActive ? (
+                                      <span className="px-3 py-1.5 rounded-xl bg-emerald-800 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm animate-pulse">
+                                        <span>👻 Ghost Cloak ({cloakLeft}s left)</span>
+                                      </span>
+                                    ) : !cloakUsed ? (
+                                      <button
+                                        type="button"
+                                        disabled={snapshot.state !== 'ACTIVE'}
+                                        onClick={() => {
+                                          soundEngine.playGhostCloakTone();
+                                          dispatchGameAction({ action: 'ACTIVATE_GHOST_CLOAK' }, '👻 Ghost Cloak Activated for 60s!');
+                                        }}
+                                        className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-emerald-800 hover:bg-emerald-700 text-white font-bold text-xs shadow-sm transition disabled:opacity-40"
+                                      >
+                                        👻 Activate Ghost Cloak
+                                      </button>
+                                    ) : (
+                                      <span className="px-3 py-1.5 rounded-xl bg-stone-200 text-stone-600 font-semibold text-xs">
+                                        👻 Ghost Cloak used
+                                      </span>
+                                    )}
+                                  </div>
+                                );
+                              })()}
+                            </div>
+                          )}
+
                           {/* Minimalist Radio Section */}
-                          <div className="p-3.5 rounded-xl bg-canvas border border-stoneline space-y-3">
+                          <div className="p-3.5 rounded-xl bg-stone-50 border border-stone-200/80 space-y-3">
                             {/* Top Row: Hold to Talk, Voice Disguise, Replay Last Radio */}
                             <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
                               <button
@@ -5118,14 +5192,14 @@ function AuiManhuntApp() {
                                 }}
                                 className={`flex-1 min-h-[46px] px-4 py-2.5 rounded-xl font-display font-extrabold text-xs sm:text-sm transition flex items-center justify-center gap-2 shadow-sm select-none ${
                                   walkieRecording
-                                    ? 'bg-red-600 text-white animate-pulse ring-4 ring-red-300'
-                                    : 'bg-indigo-900 hover:bg-indigo-950 text-white active:scale-[0.99]'
+                                    ? 'bg-rose-600 text-white animate-pulse ring-4 ring-rose-300'
+                                    : 'bg-emerald-800 hover:bg-emerald-700 text-white active:scale-[0.99]'
                                 }`}
                               >
                                 <span>{walkieRecording ? '🔴 Transmitting Voice...' : '🎙️ Hold to Talk'}</span>
                                 {walkieRecording && (
                                   <span className="px-1.5 py-0.5 rounded-full bg-white/20 font-mono text-[11px]">
-                                    {walkieRecordingSeconds}s / 6s
+                                    {walkieRecordingSeconds}s / 4s
                                   </span>
                                 )}
                               </button>
@@ -5136,18 +5210,18 @@ function AuiManhuntApp() {
                                   onClick={() => setWalkieDisguised((prev) => !prev)}
                                   className={`min-h-[46px] px-3.5 py-2 rounded-xl text-xs font-bold border transition flex items-center gap-1.5 ${
                                     walkieDisguised
-                                      ? 'bg-purple-900 text-white border-purple-700 shadow-sm'
-                                      : 'bg-white text-ink-secondary border-stoneline hover:bg-subtle'
+                                      ? 'bg-stone-800 text-white border-stone-700 shadow-sm'
+                                      : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
                                   }`}
                                 >
-                                  <span>🕵️ Voice Disguise: {walkieDisguised ? 'ON' : 'OFF'}</span>
+                                  <span>🕵️ Disguise: {walkieDisguised ? 'ON' : 'OFF'}</span>
                                 </button>
 
                                 <button
                                   type="button"
                                   disabled={!lastReceivedRadio && !snapshot.latestVoiceClip && !snapshot.latestRadioMessage && !snapshot.latestRadioCallout && !lastRadioAudioRef.current}
                                   onClick={handleReplayLastRadioMessage}
-                                  className="btn-secondary min-h-[46px] px-3.5 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 disabled:opacity-40"
+                                  className="min-h-[46px] px-3.5 py-2 rounded-xl text-xs font-bold bg-white hover:bg-stone-100 text-stone-800 border border-stone-200 shadow-sm flex items-center gap-1.5 disabled:opacity-40"
                                 >
                                   <span>🔊 Replay Last Radio</span>
                                 </button>
@@ -5155,12 +5229,12 @@ function AuiManhuntApp() {
                             </div>
 
                             {/* 4 Role-Tailored Callout Chips */}
-                            <div className="pt-2 border-t border-stoneline/80 space-y-2">
+                            <div className="pt-2 border-t border-stone-200/80 space-y-2">
                               <div className="flex items-center justify-between">
-                                <span className="text-xs font-bold text-ink flex items-center gap-1.5">
+                                <span className="text-xs font-bold text-stone-900 flex items-center gap-1.5">
                                   <span>⚡</span> Tactical Callouts ({isHunter ? 'Hunter Team' : 'Hider Team'})
                                 </span>
-                                <span className="text-[10px] text-ink-muted">Instant TTS broadcast</span>
+                                <span className="text-[10px] text-stone-500">Instant TTS broadcast</span>
                               </div>
                               <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
                                 {(isHunter ? HUNTER_CALLOUT_CHIPS : HIDER_CALLOUT_CHIPS).map((callout) => (
@@ -5168,7 +5242,7 @@ function AuiManhuntApp() {
                                     key={callout}
                                     type="button"
                                     onClick={() => handleSendSilentRadioTTS(callout)}
-                                    className="min-h-[40px] px-2.5 py-1.5 rounded-xl bg-white hover:bg-subtle border border-stoneline text-[11px] font-bold text-ink transition active:scale-95 text-center flex items-center justify-center shadow-xs"
+                                    className="min-h-[40px] px-2.5 py-1.5 rounded-xl bg-white hover:bg-stone-100 border border-stone-200 text-[11px] font-bold text-stone-800 transition active:scale-95 text-center flex items-center justify-center shadow-xs"
                                   >
                                     <span>{callout}</span>
                                   </button>
@@ -5189,16 +5263,44 @@ function AuiManhuntApp() {
                                     }
                                   }}
                                   placeholder="Type silent radio message..."
-                                  className="flex-1 h-11 px-3.5 rounded-xl bg-white border border-stoneline text-xs font-semibold text-ink placeholder:text-ink-muted focus:outline-none focus:ring-2 focus:ring-cedar"
+                                  className="flex-1 h-11 px-3.5 rounded-xl bg-white border border-stone-200 text-xs font-semibold text-stone-900 placeholder:text-stone-400 focus:outline-none focus:ring-2 focus:ring-emerald-700"
                                 />
                                 <button
                                   type="button"
                                   disabled={!silentRadioInput.trim()}
                                   onClick={() => handleSendSilentRadioTTS(silentRadioInput)}
-                                  className="btn-cedar h-11 px-4 rounded-xl text-xs font-bold shrink-0 disabled:opacity-40"
+                                  className="h-11 px-4 rounded-xl text-xs font-bold shrink-0 bg-emerald-800 hover:bg-emerald-700 text-white disabled:opacity-40 transition"
                                 >
                                   Transmit 📻
                                 </button>
+                              </div>
+                            </div>
+
+                            {/* Quick Taunts Soundboard */}
+                            <div className="pt-2 border-t border-stone-200/80 space-y-1.5">
+                              <div className="flex items-center justify-between">
+                                <span className="text-xs font-bold text-stone-900 flex items-center gap-1.5">
+                                  <span>📣</span> Quick Taunts (Instant Audio)
+                                </span>
+                                {(snapshot?.tauntCooldownSecondsLeft || 0) > 0 && (
+                                  <span className="text-[10px] text-amber-700 font-mono">
+                                    Cooldown: {snapshot.tauntCooldownSecondsLeft}s
+                                  </span>
+                                )}
+                              </div>
+                              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                                {TAUNT_OPTIONS.map((taunt) => (
+                                  <button
+                                    key={taunt.type}
+                                    type="button"
+                                    disabled={(snapshot?.tauntCooldownSecondsLeft || 0) > 0}
+                                    onClick={() => handleSendTaunt(taunt.type)}
+                                    className="min-h-[38px] px-2 py-1 rounded-xl bg-white hover:bg-stone-100 border border-stone-200 text-[11px] font-semibold text-stone-800 transition active:scale-95 text-center flex items-center justify-center gap-1.5 shadow-xs disabled:opacity-40"
+                                  >
+                                    <span>{taunt.emoji}</span>
+                                    <span className="truncate">{taunt.label}</span>
+                                  </button>
+                                ))}
                               </div>
                             </div>
                           </div>
@@ -5212,15 +5314,50 @@ function AuiManhuntApp() {
                     {!isRadioEnabled && (
                       <div className="space-y-3">
                         {!isHunter ? (
-                          <div className="p-3.5 rounded-xl bg-canvas border border-stoneline text-xs text-ink-secondary space-y-3">
-                            <strong className="text-ink block">Hider Tactical Abilities &amp; Status</strong>
+                          <div className="p-3.5 rounded-xl bg-stone-50 border border-stone-200/80 text-xs text-stone-700 space-y-3">
+                            <strong className="text-stone-900 block font-bold">Hider Tactical Abilities &amp; Status</strong>
                             <div className="flex flex-wrap items-center gap-2.5">
                               {catchMode === 'CATCH_PIN' && snapshot.viewerCatchPin && (
                                 <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-300 text-amber-950">
                                   <span className="block text-[10px] uppercase font-bold text-amber-800">2-Digit Catch PIN</span>
-                                  <span className="font-mono font-extrabold text-lg tracking-widest text-hunter">{snapshot.viewerCatchPin}</span>
+                                  <span className="font-mono font-extrabold text-lg tracking-widest text-rose-600">{snapshot.viewerCatchPin}</span>
                                 </div>
                               )}
+                              {(() => {
+                                const cloakUntil = snapshot.viewerGhostCloak?.activeUntilMs || 0;
+                                const cloakLeft = cloakUntil > nowTick
+                                  ? Math.max(0, Math.ceil((cloakUntil - nowTick) / 1000))
+                                  : snapshot.viewerGhostCloak?.active
+                                  ? snapshot.viewerGhostCloak.secondsLeft
+                                  : 0;
+                                const cloakActive = cloakLeft > 0;
+                                const cloakUsed = Boolean(snapshot.viewerGhostCloak?.used);
+                                return (
+                                  <div>
+                                    {cloakActive ? (
+                                      <span className="px-3 py-1.5 rounded-xl bg-emerald-800 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm animate-pulse">
+                                        <span>👻 Ghost Cloak ({cloakLeft}s left)</span>
+                                      </span>
+                                    ) : !cloakUsed ? (
+                                      <button
+                                        type="button"
+                                        disabled={snapshot.state !== 'ACTIVE'}
+                                        onClick={() => {
+                                          soundEngine.playGhostCloakTone();
+                                          dispatchGameAction({ action: 'ACTIVATE_GHOST_CLOAK' }, '👻 Ghost Cloak Activated for 60s!');
+                                        }}
+                                        className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-emerald-800 hover:bg-emerald-700 text-white font-bold text-xs shadow-sm transition disabled:opacity-40"
+                                      >
+                                        👻 Activate Ghost Cloak
+                                      </button>
+                                    ) : (
+                                      <span className="px-3 py-1.5 rounded-xl bg-stone-200 text-stone-600 font-semibold text-xs">
+                                        👻 Ghost Cloak used
+                                      </span>
+                                    )}
+                                  </div>
+                                );
+                              })()}
                             </div>
                             {me?.photoRequest?.status === 'PENDING' && (
                               <button
@@ -5230,7 +5367,7 @@ function AuiManhuntApp() {
                                   setCameraStreamError(null);
                                   setShowCameraModal(true);
                                 }}
-                                className="btn-hunter px-3.5 py-2 rounded-xl text-xs font-bold"
+                                className="min-h-[38px] px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition"
                               >
                                 📷 Respond to Photo Request ({me.photoRequest.expiresInSeconds}s left)
                               </button>
@@ -5317,7 +5454,7 @@ function AuiManhuntApp() {
                                   <span className="px-2 py-0.5 rounded-full bg-red-100 text-red-800 text-[10px] font-bold">Caught</span>
                                 )}
                                 {p.ghostCloakActive && !p.isOutOfBoundsExposed && (
-                                  <span className="px-2 py-0.5 rounded-full bg-purple-100 text-purple-900 text-[10px] font-bold">
+                                  <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-900 border border-emerald-300 text-[10px] font-bold">
                                     👻 Cloaked ({p.ghostCloakSecondsLeft}s)
                                   </span>
                                 )}
@@ -6003,7 +6140,7 @@ function AuiManhuntApp() {
       </div>
 
       {/* Persistent unlocked Walkie-Talkie audio element */}
-      <audio ref={walkiePlayerRef} playsInline preload="auto" className="hidden" />
+      <audio ref={walkieAudioRef} playsInline preload="auto" className="hidden" />
     </div>
   );
 }
