@@ -20,9 +20,19 @@ CREATE TABLE IF NOT EXISTS public.games (
   paused_remaining_ms INT,
   winner_team VARCHAR(20) CHECK (winner_team IN ('HUNTERS', 'HIDERS', 'NONE')),
   win_reason TEXT,
+  latest_voice_clip JSONB,
+  latest_radio_callout JSONB,
+  settings_json JSONB,
+  events_json JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Idempotent schema upgrades for existing installations:
+ALTER TABLE public.games ADD COLUMN IF NOT EXISTS latest_voice_clip JSONB;
+ALTER TABLE public.games ADD COLUMN IF NOT EXISTS latest_radio_callout JSONB;
+ALTER TABLE public.games ADD COLUMN IF NOT EXISTS settings_json JSONB;
+ALTER TABLE public.games ADD COLUMN IF NOT EXISTS events_json JSONB;
 
 CREATE TABLE IF NOT EXISTS public.participants (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

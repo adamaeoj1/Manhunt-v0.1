@@ -118,6 +118,11 @@ class ManhuntSoundEngine {
       if (cleaned) return;
       cleaned = true;
       try {
+        if ('stop' in sourceNode) {
+          (sourceNode as OscillatorNode).stop();
+        }
+      } catch {}
+      try {
         if ('disconnect' in sourceNode) sourceNode.disconnect();
       } catch {}
       nodesToDisconnect.forEach((node) => {
@@ -239,6 +244,19 @@ class ManhuntSoundEngine {
 
         osc.connect(gain);
         gain.connect(dest);
+
+        osc.onended = () => {
+          try {
+            osc.stop();
+          } catch {}
+          try {
+            osc.disconnect();
+          } catch {}
+          try {
+            gain.disconnect();
+          } catch {}
+        };
+
         osc.start(start);
         osc.stop(start + dur);
         this.scheduleNodeCleanup(osc, [gain], offset + dur);
@@ -357,6 +375,19 @@ class ManhuntSoundEngine {
 
         osc.connect(gain);
         gain.connect(dest);
+
+        osc.onended = () => {
+          try {
+            osc.stop();
+          } catch {}
+          try {
+            osc.disconnect();
+          } catch {}
+          try {
+            gain.disconnect();
+          } catch {}
+        };
+
         osc.start(start);
         osc.stop(start + dur);
         this.scheduleNodeCleanup(osc, [gain], offset + dur);
@@ -450,6 +481,19 @@ class ManhuntSoundEngine {
 
         osc.connect(gain);
         gain.connect(dest);
+
+        osc.onended = () => {
+          try {
+            osc.stop();
+          } catch {}
+          try {
+            osc.disconnect();
+          } catch {}
+          try {
+            gain.disconnect();
+          } catch {}
+        };
+
         osc.start(start);
         osc.stop(start + dur);
         this.scheduleNodeCleanup(osc, [gain], offset + dur);
@@ -598,7 +642,7 @@ class ManhuntSoundEngine {
 
   /**
    * Walkie-Talkie Radio Squelch + PTT Chirp:
-   * Realistic bandpass-filtered white noise burst + tactical two-tone chirp.
+   * Gentle, soft radio chirp (120ms at volume 0.08) for clean tactical realism without harsh distortion.
    */
   public playRadioSquelch(phase: 'START' | 'END' = 'START'): boolean {
     try {
@@ -610,13 +654,13 @@ class ManhuntSoundEngine {
       const dest = this.getDestination(ctx);
 
       const now = ctx.currentTime;
-      const noiseDur = 0.14;
+      const noiseDur = 0.12; // 120ms
       const sampleRate = ctx.sampleRate;
       const frameCount = Math.max(1, Math.floor(sampleRate * noiseDur));
       const noiseBuffer = ctx.createBuffer(1, frameCount, sampleRate);
       const data = noiseBuffer.getChannelData(0);
       for (let i = 0; i < frameCount; i++) {
-        data[i] = (Math.random() * 2 - 1) * 0.65;
+        data[i] = (Math.random() * 2 - 1) * 0.12;
       }
 
       const noiseSource = ctx.createBufferSource();
@@ -624,12 +668,12 @@ class ManhuntSoundEngine {
 
       const filter = ctx.createBiquadFilter();
       filter.type = 'bandpass';
-      filter.frequency.setValueAtTime(1350, now);
-      filter.Q.setValueAtTime(1.4, now);
+      filter.frequency.setValueAtTime(1400, now);
+      filter.Q.setValueAtTime(1.8, now);
 
       const noiseGain = ctx.createGain();
-      noiseGain.gain.setValueAtTime(0.01, now);
-      noiseGain.gain.linearRampToValueAtTime(0.5, now + 0.02);
+      noiseGain.gain.setValueAtTime(0.001, now);
+      noiseGain.gain.linearRampToValueAtTime(0.08, now + 0.015);
       noiseGain.gain.exponentialRampToValueAtTime(0.001, now + noiseDur);
 
       noiseSource.connect(filter);
@@ -639,29 +683,27 @@ class ManhuntSoundEngine {
       noiseSource.stop(now + noiseDur);
       this.scheduleNodeCleanup(noiseSource, [filter, noiseGain], noiseDur);
 
-      // PTT Chirp tones
-      const tones = phase === 'START' ? [1420, 1880] : [1880, 1320];
-      tones.forEach((freq, idx) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        const start = now + 0.03 + idx * 0.045;
-        const dur = 0.045;
+      // Gentle short tactical chirp tone (very subtle volume 0.08)
+      const toneFreq = phase === 'START' ? 1600 : 1250;
+      const osc = ctx.createOscillator();
+      const toneGain = ctx.createGain();
+      const start = now + 0.02;
+      const dur = 0.06;
 
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(freq, start);
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(toneFreq, start);
 
-        gain.gain.setValueAtTime(0.001, start);
-        gain.gain.linearRampToValueAtTime(0.42, start + 0.008);
-        gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
+      toneGain.gain.setValueAtTime(0.001, start);
+      toneGain.gain.linearRampToValueAtTime(0.08, start + 0.01);
+      toneGain.gain.exponentialRampToValueAtTime(0.001, start + dur);
 
-        osc.connect(gain);
-        gain.connect(dest);
-        osc.start(start);
-        osc.stop(start + dur);
-        this.scheduleNodeCleanup(osc, [gain], 0.03 + idx * 0.045 + dur);
-      });
+      osc.connect(toneGain);
+      toneGain.connect(dest);
+      osc.start(start);
+      osc.stop(start + dur);
+      this.scheduleNodeCleanup(osc, [toneGain], 0.02 + dur);
 
-      this.vibrate(phase === 'START' ? [45] : [30, 30]);
+      this.vibrate(phase === 'START' ? [25] : [20]);
       return true;
     } catch {
       return false;
@@ -742,11 +784,11 @@ class ManhuntSoundEngine {
           const decodedBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0));
           const source = ctx.createBufferSource();
           source.buffer = decodedBuffer;
-          source.playbackRate.value = disguisePitch ? 0.78 : 1.0;
+          source.playbackRate.value = disguisePitch ? 0.88 : 1.0;
 
           const radioFilter = ctx.createBiquadFilter();
           radioFilter.type = 'bandpass';
-          radioFilter.frequency.setValueAtTime(disguisePitch ? 980 : 1450, ctx.currentTime);
+          radioFilter.frequency.setValueAtTime(disguisePitch ? 1100 : 1450, ctx.currentTime);
           radioFilter.Q.setValueAtTime(0.85, ctx.currentTime);
 
           const boostGain = ctx.createGain();
@@ -768,7 +810,7 @@ class ManhuntSoundEngine {
           this.scheduleNodeCleanup(
             source,
             [radioFilter, boostGain],
-            decodedBuffer.duration / (disguisePitch ? 0.78 : 1.0) + 0.5
+            decodedBuffer.duration / (disguisePitch ? 0.88 : 1.0) + 0.5
           );
           return true;
         } catch {
@@ -787,7 +829,7 @@ class ManhuntSoundEngine {
         anyAudio.preservesPitch = false;
         anyAudio.mozPreservesPitch = false;
         anyAudio.webkitPreservesPitch = false;
-        audioEl.playbackRate = 0.78;
+        audioEl.playbackRate = 0.88;
       }
       audioEl.onended = () => finishPlayback();
       audioEl.onerror = () => finishPlayback();
@@ -834,8 +876,8 @@ class ManhuntSoundEngine {
         window.speechSynthesis.cancel();
         const utterance = new SpeechSynthesisUtterance(cleanText);
         utterance.lang = 'en-US';
-        utterance.pitch = disguised ? 0.65 : 1.05;
-        utterance.rate = disguised ? 0.92 : 1.08;
+        utterance.rate = 1.05;
+        utterance.pitch = disguised ? 0.6 : 1.0;
         utterance.volume = 1.0;
 
         utterance.onend = () => {
