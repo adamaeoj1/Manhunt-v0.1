@@ -24,13 +24,13 @@ export interface AuiLandmark {
 }
 
 export const AUI_LANDMARKS: AuiLandmark[] = [
-  { id: 'gate', name: 'Main Gate & Security', category: 'Entrance', icon: '🚪', lat: 33.54130, lng: -5.10515 },
-  { id: 'mosque', name: 'AUI Grand Mosque', category: 'Worship', icon: '🕌', lat: 33.54070, lng: -5.10775 },
-  { id: 'library', name: 'Mohammed VI Library', category: 'Study', icon: '🏛️', lat: 33.53875, lng: -5.10705 },
-  { id: 'student_center', name: 'Student Center & Dining', category: 'Dining', icon: '🍽️', lat: 33.54035, lng: -5.10620 },
-  { id: 'quad', name: 'Academic Quad (Bldgs 1-8)', category: 'Classes', icon: '🎓', lat: 33.53965, lng: -5.10735 },
-  { id: 'sports', name: 'Sports Complex & Pool', category: 'Athletics', icon: '⚽', lat: 33.53995, lng: -5.10865 },
-  { id: 'dorms', name: 'Residence Halls (Dorms)', category: 'Housing', icon: '🏢', lat: 33.54085, lng: -5.10480 },
+  { id: 'gate', name: 'Main Gate (البوابة الرئيسية)', category: 'Entrance', icon: '🚪', lat: 33.54115, lng: -5.10520 },
+  { id: 'mosque', name: 'Mosque (المسجد)', category: 'Worship', icon: '🕌', lat: 33.54055, lng: -5.10740 },
+  { id: 'library', name: 'Mohammed VI Library (المكتبة)', category: 'Study', icon: '🏛️', lat: 33.53890, lng: -5.10670 },
+  { id: 'student_center', name: 'Student Center & Dining (مركز الطلاب والمطعم)', category: 'Dining', icon: '🍽️', lat: 33.54020, lng: -5.10590 },
+  { id: 'quad', name: 'Academic Quad (المباني الأكاديمية)', category: 'Classes', icon: '🎓', lat: 33.53950, lng: -5.10650 },
+  { id: 'sports', name: 'Sports Complex & Pool (المجمع الرياضي)', category: 'Athletics', icon: '⚽', lat: 33.53895, lng: -5.10780 },
+  { id: 'dorms', name: 'Residence Halls / Dorms (السكن الجامعي)', category: 'Housing', icon: '🏢', lat: 33.54070, lng: -5.10470 },
 ];
 
 interface CampusMapProps {
@@ -50,7 +50,11 @@ interface CachedMarkerEntry {
   lastRawLat: number;
   lastRawLng: number;
   lastAccuracy: number;
-  lastIconSig: string;
+  lastAgeSeconds: number;
+  lastIsStale: boolean;
+  lastRole: 'HUNTER' | 'HIDER' | 'HIDDEN' | null;
+  lastIsSelf: boolean;
+  lastNickname: string;
   lastZOffset: number;
 }
 
@@ -359,7 +363,6 @@ function CampusMapInner({
         const roleLabel = isHunter ? 'HUNTER' : 'HIDER';
         const ageText = m.isStale ? `Stale ${m.ageSeconds}s` : `${m.ageSeconds}s`;
         const zOffset = m.isSelf ? 1000 : isHunter ? 500 : 100;
-        const iconSig = `${m.nickname}|${m.role}|${m.isSelf}|${m.accuracy}|${m.isStale}|${ageText}`;
 
         const buildIcon = () => {
           const selfBadge = m.isSelf
@@ -412,7 +415,11 @@ function CampusMapInner({
             lastRawLat: m.lat,
             lastRawLng: m.lng,
             lastAccuracy: m.accuracy,
-            lastIconSig: iconSig,
+            lastAgeSeconds: m.ageSeconds,
+            lastIsStale: m.isStale,
+            lastRole: m.role,
+            lastIsSelf: m.isSelf,
+            lastNickname: m.nickname,
             lastZOffset: zOffset,
           });
         } else {
@@ -421,9 +428,21 @@ function CampusMapInner({
             existing.lastDisplayLat = pos.lat;
             existing.lastDisplayLng = pos.lng;
           }
-          if (existing.lastIconSig !== iconSig) {
+          const hasVisualChange =
+            existing.lastRole !== m.role ||
+            existing.lastIsStale !== m.isStale ||
+            existing.lastAccuracy !== m.accuracy ||
+            existing.lastAgeSeconds !== m.ageSeconds ||
+            existing.lastIsSelf !== m.isSelf ||
+            existing.lastNickname !== m.nickname;
+          if (hasVisualChange) {
             existing.marker.setIcon(buildIcon());
-            existing.lastIconSig = iconSig;
+            existing.lastRole = m.role;
+            existing.lastIsStale = m.isStale;
+            existing.lastAccuracy = m.accuracy;
+            existing.lastAgeSeconds = m.ageSeconds;
+            existing.lastIsSelf = m.isSelf;
+            existing.lastNickname = m.nickname;
           }
           if (existing.lastZOffset !== zOffset && existing.marker.setZIndexOffset) {
             existing.marker.setZIndexOffset(zOffset);
@@ -465,7 +484,7 @@ function CampusMapInner({
           onClick={() => setMapLayer((prev) => (prev === 'street' ? 'satellite' : 'street'))}
           className="h-8 px-2.5 rounded-lg bg-white/95 backdrop-blur border border-stone-300 shadow-md text-xs font-bold text-stone-800 hover:bg-stone-100 transition flex items-center gap-1 select-none"
         >
-          <span>{mapLayer === 'street' ? '🛰️ Satellite' : '🗺️ Map'}</span>
+          <span>{mapLayer === 'street' ? '🛰️ قمر صناعي / Satellite' : '🗺️ خريطة / Street'}</span>
         </button>
         <button
           type="button"
@@ -476,7 +495,7 @@ function CampusMapInner({
               : 'bg-white/95 border-stone-300 text-stone-800 hover:bg-stone-100'
           }`}
         >
-          <span>📍 AUI Landmarks</span>
+          <span>📍 معالم الجامعة / Landmarks</span>
         </button>
       </div>
     </div>

@@ -118,6 +118,11 @@ class ManhuntSoundEngine {
       if (cleaned) return;
       cleaned = true;
       try {
+        if ('stop' in sourceNode) {
+          (sourceNode as OscillatorNode).stop();
+        }
+      } catch {}
+      try {
         if ('disconnect' in sourceNode) sourceNode.disconnect();
       } catch {}
       nodesToDisconnect.forEach((node) => {
@@ -239,6 +244,19 @@ class ManhuntSoundEngine {
 
         osc.connect(gain);
         gain.connect(dest);
+
+        osc.onended = () => {
+          try {
+            osc.stop();
+          } catch {}
+          try {
+            osc.disconnect();
+          } catch {}
+          try {
+            gain.disconnect();
+          } catch {}
+        };
+
         osc.start(start);
         osc.stop(start + dur);
         this.scheduleNodeCleanup(osc, [gain], offset + dur);
@@ -357,6 +375,19 @@ class ManhuntSoundEngine {
 
         osc.connect(gain);
         gain.connect(dest);
+
+        osc.onended = () => {
+          try {
+            osc.stop();
+          } catch {}
+          try {
+            osc.disconnect();
+          } catch {}
+          try {
+            gain.disconnect();
+          } catch {}
+        };
+
         osc.start(start);
         osc.stop(start + dur);
         this.scheduleNodeCleanup(osc, [gain], offset + dur);
@@ -450,6 +481,19 @@ class ManhuntSoundEngine {
 
         osc.connect(gain);
         gain.connect(dest);
+
+        osc.onended = () => {
+          try {
+            osc.stop();
+          } catch {}
+          try {
+            osc.disconnect();
+          } catch {}
+          try {
+            gain.disconnect();
+          } catch {}
+        };
+
         osc.start(start);
         osc.stop(start + dur);
         this.scheduleNodeCleanup(osc, [gain], offset + dur);
@@ -834,8 +878,8 @@ class ManhuntSoundEngine {
         window.speechSynthesis.cancel();
         const utterance = new SpeechSynthesisUtterance(cleanText);
         utterance.lang = 'en-US';
-        utterance.pitch = disguised ? 0.65 : 1.05;
-        utterance.rate = disguised ? 0.92 : 1.08;
+        utterance.rate = 1.05;
+        utterance.pitch = disguised ? 0.6 : 1.0;
         utterance.volume = 1.0;
 
         utterance.onend = () => {

@@ -11,6 +11,7 @@ import {
   TeammateVisibilityMode,
   HunterVisibilityMode,
   TauntType,
+  containsProfanity,
 } from './validation';
 import { isSupabaseConfigured, getSupabaseAdminClient } from './supabase-server';
 
@@ -79,6 +80,27 @@ export interface WalkieTalkieMessageRecord {
   voiceText?: string;
   disguised: boolean;
   durationSeconds: number;
+  createdAt: number;
+}
+
+export interface LatestRadioMessageRecord {
+  id: string;
+  senderId: string;
+  senderName: string;
+  type: 'AUDIO' | 'TTS';
+  content: string;
+  createdAt: number;
+}
+
+export interface LatestRadioCalloutRecord {
+  id: string;
+  senderId: string;
+  senderName: string;
+  senderRole: PlayerRole | null;
+  text: string;
+  disguised: boolean;
+  type?: 'TTS' | 'TAUNT';
+  tauntType?: TauntType;
   createdAt: number;
 }
 
@@ -182,6 +204,8 @@ export interface GameRecord {
   ghostCloakByHider: Map<string, { usedCount: number; maxUses: number; activeUntil: number }>;
   catchPinsByHider: Map<string, string>;
   latestVoiceClip: VoiceClipRecord | null;
+  latestRadioMessage: LatestRadioMessageRecord | null;
+  latestRadioCallout: LatestRadioCalloutRecord | null;
 }
 
 const AVATAR_COLORS = ['#14532D', '#C2410C', '#0369A1', '#7E22CE', '#B45309', '#BE123C'];
@@ -227,6 +251,8 @@ interface SerializedGameRecord {
   soundAlerts: SoundAlertRecord[];
   walkieMessages: WalkieTalkieMessageRecord[];
   latestVoiceClip?: VoiceClipRecord | null;
+  latestRadioMessage?: LatestRadioMessageRecord | null;
+  latestRadioCallout?: LatestRadioCalloutRecord | null;
   tauntAlerts: TauntAlertRecord[];
   capturesLog: CaptureLogRecord[];
   events?: GameEventRecord[];
@@ -258,8 +284,20 @@ function serializeGameRecord(game: GameRecord): SerializedGameRecord {
     locations: Array.from(game.locations.entries()),
     soundUsage: Array.from(game.soundUsage.entries()),
     soundAlerts: game.soundAlerts,
-    walkieMessages: game.walkieMessages,
-    latestVoiceClip: game.latestVoiceClip || null,
+    walkieMessages: (game.walkieMessages || []).map((m) => ({
+      ...m,
+      audioDataUrl: undefined,
+      hasAudio: Boolean(m.hasAudio || m.audioDataUrl),
+    })),
+    latestVoiceClip: game.latestVoiceClip
+      ? { ...game.latestVoiceClip }
+      : null,
+    latestRadioMessage: game.latestRadioMessage
+      ? { ...game.latestRadioMessage }
+      : null,
+    latestRadioCallout: game.latestRadioCallout
+      ? { ...game.latestRadioCallout }
+      : null,
     tauntAlerts: game.tauntAlerts,
     capturesLog: game.capturesLog,
     events: game.events || [],
@@ -294,6 +332,8 @@ function deserializeGameRecord(raw: SerializedGameRecord): GameRecord {
     soundAlerts: raw.soundAlerts || [],
     walkieMessages: raw.walkieMessages || [],
     latestVoiceClip: raw.latestVoiceClip || null,
+    latestRadioMessage: raw.latestRadioMessage || null,
+    latestRadioCallout: raw.latestRadioCallout || null,
     tauntAlerts: raw.tauntAlerts || [],
     capturesLog: raw.capturesLog || [],
     events: raw.events || [],
@@ -517,6 +557,9 @@ export async function createGameSession(input: {
   if (cleanHostNickname.length < 3 || cleanHostNickname.length > 15) {
     throw new Error('Nickname must be between 3 and 15 characters.');
   }
+  if (containsProfanity(cleanHostNickname)) {
+    throw new Error('Please choose an appropriate nickname.');
+  }
 
   const code = normalizeRoomCode(generateRoomCode());
   const now = Date.now();
@@ -615,6 +658,8 @@ export async function createGameSession(input: {
     soundAlerts: [],
     walkieMessages: [],
     latestVoiceClip: null,
+    latestRadioMessage: null,
+    latestRadioCallout: null,
     tauntAlerts: [],
     capturesLog: [],
     events: [],
@@ -713,6 +758,9 @@ export async function joinGameSession(code: string, nickname: string) {
   }
   if (cleanName.length < 3 || cleanName.length > 15) {
     throw new Error('Nickname must be between 3 and 15 characters.');
+  }
+  if (containsProfanity(cleanName)) {
+    throw new Error('Please choose an appropriate nickname.');
   }
 
   const localGame = loadRoomFromSharedStore(cleanCode);
@@ -1014,6 +1062,8 @@ export async function performGameAction(code: string, payload: Record<string, un
       game.soundAlerts = [];
       game.walkieMessages = [];
       game.latestVoiceClip = null;
+      game.latestRadioMessage = null;
+      game.latestRadioCallout = null;
       game.tauntAlerts = [];
       game.capturesLog = [];
       game.tauntCooldownByParticipant.clear();
@@ -1144,15 +1194,36 @@ export async function performGameAction(code: string, payload: Record<string, un
       };
 
       game.latestVoiceClip = voiceClip;
+      game.latestRadioMessage = {
+        id: clipId,
+        senderId: participantId,
+        senderName: actor.nickname,
+        type: audioDataUrl ? 'AUDIO' : 'TTS',
+        content: voiceText || '',
+        createdAt: now,
+      };
+      if (voiceText) {
+        game.latestRadioCallout = {
+          id: clipId,
+          senderId: participantId,
+          senderName: actor.nickname,
+          senderRole: game.secretRoles.get(participantId) || null,
+          text: voiceText,
+          disguised,
+          type: 'TTS',
+          createdAt: now,
+        };
+      }
       game.walkieMessages = (game.walkieMessages || [])
         .filter((m) => now - m.createdAt < 25000)
-        .slice(-5);
+        .slice(-5)
+        .map((m) => ({ ...m, audioDataUrl: undefined, hasAudio: Boolean(m.hasAudio || m.audioDataUrl) }));
       game.walkieMessages.push({
         id: clipId,
         senderId: participantId,
         senderNickname: actor.nickname,
         senderRole: game.secretRoles.get(participantId) || null,
-        audioDataUrl: audioDataUrl || '',
+        hasAudio: Boolean(audioDataUrl),
         voiceText,
         disguised,
         durationSeconds,
@@ -1203,6 +1274,26 @@ export async function performGameAction(code: string, payload: Record<string, un
         I_SEE_YOU: '👀 I See You!',
         AIRHORN: '📯 Airhorn Taunt!',
         TOO_SLOW: '👻 Too Slow!',
+      };
+      const tauntMsg = tauntTextMap[tauntType] || 'Taunt!';
+      game.latestRadioCallout = {
+        id: taunt.id,
+        senderId: participantId,
+        senderName: actor.nickname,
+        senderRole: game.secretRoles.get(participantId) || null,
+        text: tauntMsg,
+        disguised: false,
+        type: 'TAUNT',
+        tauntType,
+        createdAt: now,
+      };
+      game.latestRadioMessage = {
+        id: taunt.id,
+        senderId: participantId,
+        senderName: actor.nickname,
+        type: 'TTS',
+        content: tauntMsg,
+        createdAt: now,
       };
       appendGameEvent(game, {
         id: taunt.id,
@@ -1467,6 +1558,8 @@ export async function performGameAction(code: string, payload: Record<string, un
       game.soundAlerts = [];
       game.walkieMessages = [];
       game.latestVoiceClip = null;
+      game.latestRadioMessage = null;
+      game.latestRadioCallout = null;
       game.tauntAlerts = [];
       game.capturesLog = [];
       game.events = [];
@@ -1917,6 +2010,7 @@ export async function getAuthorizedGameState(
         photoRequestView = {
           id: pr.id,
           status: pr.status,
+          expiresAt: pr.expiresAt,
           expiresInSeconds: Math.max(0, Math.ceil((pr.expiresAt - now) / 1000)),
           hasPhoto: canViewPhoto,
           photoDataUrl: shouldIncludePhoto ? pr.photoDataUrl : null,
@@ -1960,6 +2054,7 @@ export async function getAuthorizedGameState(
       remainingUses: Math.max(0, game.settings.soundUsesPerHunter - usage.usedCount),
       maxUses: game.settings.soundUsesPerHunter,
       cooldownSecondsLeft: Math.max(0, Math.ceil((usage.cooldownUntil - now) / 1000)),
+      cooldownUntilMs: usage.cooldownUntil || 0,
     };
   }
 
@@ -1982,6 +2077,7 @@ export async function getAuthorizedGameState(
       maxUses,
       remainingUses,
       active,
+      activeUntilMs: cloak?.activeUntil || 0,
       secondsLeft: active && cloak ? Math.max(0, Math.ceil((cloak.activeUntil - now) / 1000)) : 0,
     };
     viewerCatchPin = game.catchPinsByHider.get(viewerId) || null;
@@ -2018,8 +2114,18 @@ export async function getAuthorizedGameState(
 
   const recentWalkieMessages = game.walkieMessages.filter((m) => m.createdAt >= eventCutoffMs);
   const rawLatestVoiceClip =
-    game.latestVoiceClip && now - game.latestVoiceClip.createdAt < 25000
+    game.latestVoiceClip && now - game.latestVoiceClip.createdAt < 60000
       ? game.latestVoiceClip
+      : null;
+
+  const rawLatestRadioCallout =
+    game.latestRadioCallout && now - game.latestRadioCallout.createdAt < 60000
+      ? game.latestRadioCallout
+      : null;
+
+  const rawLatestRadioMessage =
+    game.latestRadioMessage && now - game.latestRadioMessage.createdAt < 60000
+      ? game.latestRadioMessage
       : null;
 
   // Optimize payload: strip heavy Base64 audioDataUrl from regular polling to prevent memory leaks and payload bloat
@@ -2047,7 +2153,7 @@ export async function getAuthorizedGameState(
         durationSeconds: rawLatestVoiceClip.durationSeconds,
         createdAt: rawLatestVoiceClip.createdAt,
         hasAudio: Boolean(rawLatestVoiceClip.audioDataUrl && rawLatestVoiceClip.audioDataUrl.length > 0),
-        audioDataUrl: includeMedia ? rawLatestVoiceClip.audioDataUrl : undefined,
+        audioDataUrl: rawLatestVoiceClip.audioDataUrl,
       }
     : null;
 
@@ -2099,6 +2205,24 @@ export async function getAuthorizedGameState(
     recentWalkieMessages: sanitizedRecentWalkie,
     latestVoiceClip,
     latestRadioClipId: rawLatestVoiceClip?.id || null,
+    latestRadioCallout: rawLatestRadioCallout
+      ? { ...rawLatestRadioCallout }
+      : null,
+    latestRadioMessage: rawLatestRadioMessage
+      ? { ...rawLatestRadioMessage }
+      : rawLatestVoiceClip
+      ? {
+          id: rawLatestVoiceClip.id,
+          senderId: rawLatestVoiceClip.senderId,
+          senderName: rawLatestVoiceClip.senderNickname,
+          type:
+            rawLatestVoiceClip.audioDataUrl || rawLatestVoiceClip.hasAudio
+              ? ('AUDIO' as const)
+              : ('TTS' as const),
+          content: rawLatestVoiceClip.voiceText || '',
+          createdAt: rawLatestVoiceClip.createdAt,
+        }
+      : null,
     recentTaunts,
     tauntCooldownSecondsLeft,
     participants: participantsView,
@@ -2187,9 +2311,22 @@ async function getSupabaseAuthorizedState(
     let visibleLocation = null;
     const rawLoc = locMap.get(p.id);
     if (rawLoc && p.status === 'ACTIVE') {
+      let hiderCanSeeHunter = false;
+      if (viewerRole === 'HIDER' && actualRole === 'HUNTER') {
+        const hMode = gameRow.hunter_visibility_mode || 'ALWAYS_LIVE';
+        if (hMode === 'ALWAYS_LIVE') {
+          hiderCanSeeHunter = true;
+        } else if (hMode === 'RADAR_PING_15S') {
+          const cycleSecond = Math.floor(now / 1000) % 15;
+          hiderCanSeeHunter = cycleSecond < 3;
+        }
+      }
       const canSeeLoc =
         isSelf ||
-        (currentState !== 'COUNTDOWN' && (actualRole === 'HIDER' || actualRole === 'HUNTER'));
+        (currentState !== 'COUNTDOWN' &&
+          (viewerRole === 'HUNTER' ||
+            (viewerRole === 'HIDER' && actualRole === 'HIDER') ||
+            hiderCanSeeHunter));
       if (canSeeLoc) {
         const updatedMs = new Date(rawLoc.updated_at).getTime();
         const ageSeconds = Math.max(0, Math.round((now - updatedMs) / 1000));
@@ -2224,6 +2361,7 @@ async function getSupabaseAuthorizedState(
       photoRequestView = {
         id: pr.id,
         status,
+        expiresAt: expMs,
         expiresInSeconds: Math.max(0, Math.ceil((expMs - now) / 1000)),
         hasPhoto: canViewPhoto,
         photoDataUrl: isNewPhoto ? pr.photo_data_url : null,
@@ -2266,6 +2404,7 @@ async function getSupabaseAuthorizedState(
       remainingUses: Math.max(0, gameRow.sound_uses_per_hunter - usedCount),
       maxUses: gameRow.sound_uses_per_hunter,
       cooldownSecondsLeft: Math.max(0, Math.ceil((cdMs - now) / 1000)),
+      cooldownUntilMs: cdMs || 0,
     };
   }
 
@@ -2331,7 +2470,7 @@ async function getSupabaseAuthorizedState(
     viewerGpsDenied: viewer.gps_denied,
     viewerAudioUnlocked: viewer.audio_unlocked,
     viewerCatchPin: null,
-    viewerGhostCloak: { used: false, usedCount: 0, maxUses: 1, remainingUses: 1, active: false, secondsLeft: 0 },
+    viewerGhostCloak: { used: false, usedCount: 0, maxUses: 1, remainingUses: 1, active: false, activeUntilMs: 0, secondsLeft: 0 },
     hunterProximity,
     settings: {
       maxPlayers: 12,
@@ -2375,6 +2514,8 @@ async function getSupabaseAuthorizedState(
     recentWalkieMessages: [] as WalkieTalkieMessageRecord[],
     latestVoiceClip: null,
     latestRadioClipId: null,
+    latestRadioCallout: null,
+    latestRadioMessage: null,
     recentTaunts: [] as TauntAlertRecord[],
     tauntCooldownSecondsLeft: 0,
     participants: participantsView,

@@ -21,20 +21,32 @@ const BLOCKED_WORDS = [
   // English profanities & slurs
   'fuck', 'shit', 'bitch', 'asshole', 'dick', 'pussy', 'cunt', 'nigger', 'nigga',
   'faggot', 'fag', 'whore', 'slut', 'bastard', 'cock', 'twat', 'wanker',
+  'kike', 'chink', 'spic', 'retard', 'coon', 'nazi', 'hitler',
   // French profanities
   'merde', 'putain', 'salope', 'connard', 'conne', 'encule', 'batard', 'pute', 'chienne',
   // Darija / Arabic transliterated profanities
   'zamel', 'zaml', 'kahba', 'qahba', '9ahba', 'tabon', 'tebon', 'zeb', 'zob', 'zbi',
-  'nik', 'nikmk', 'weldlhram', 'weldrab', 'tezz', 'hmar', 'kelb', 'klb'
+  'nik', 'nikmk', 'weldlhram', 'weldrab', 'tezz', 'hmar', 'kelb', 'klb',
+  // Arabic script profanities
+  'قحبة', 'زامل', 'طبون', 'زب', 'طيز', 'شرموطة', 'منيوك', 'كس'
 ];
 
 /**
- * Strict profanity check normalizing leetspeak, punctuation, and repeated characters.
+ * Strict profanity and offensive language check normalizing leetspeak, punctuation, and repeated characters.
  */
 export function containsProfanity(raw: string): boolean {
   if (!raw) return false;
+  const lower = raw.toLowerCase().trim();
+
+  // Direct check for Arabic and multibyte strings
+  for (const word of BLOCKED_WORDS) {
+    if (lower.includes(word)) {
+      return true;
+    }
+  }
+
   // Normalize leetspeak and symbols
-  let text = raw.toLowerCase()
+  let text = lower
     .replace(/[@4]/g, 'a')
     .replace(/[\$5]/g, 's')
     .replace(/[0]/g, 'o')
@@ -61,7 +73,7 @@ export const NicknameSchema = z
   .min(3, 'Nickname must be at least 3 characters.')
   .max(15, 'Nickname cannot exceed 15 characters.')
   .refine((val) => !containsProfanity(val), {
-    message: 'Nickname contains inappropriate or offensive language.',
+    message: 'Please choose an appropriate nickname.',
   });
 
 export const CreateGameSchema = z.object({

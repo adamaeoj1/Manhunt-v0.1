@@ -16,6 +16,7 @@ import {
   TeammateVisibilityMode,
   HunterVisibilityMode,
   TauntType,
+  containsProfanity,
 } from '@/lib/validation';
 
 const TAUNT_OPTIONS: Array<{ type: TauntType; label: string; emoji: string }> = [
@@ -36,7 +37,7 @@ const HIDER_CALLOUT_CHIPS: string[] = [
   'Hunter approaching!',
   'Relocating now!',
   'All clear in the dorms!',
-  'Catch me if you can!',
+  'Watch out, stay low!',
 ];
 
 const QUICK_NOTE_PRESETS: string[] = [
@@ -123,6 +124,7 @@ interface ParticipantView {
     id: string;
     status: 'PENDING' | 'SUBMITTED' | 'DECLINED' | 'EXPIRED';
     expiresInSeconds: number;
+    expiresAt?: number;
     hasPhoto: boolean;
     photoDataUrl: string | null;
     remainingRequests?: number;
@@ -155,6 +157,7 @@ interface GameSnapshot {
     maxUses?: number;
     remainingUses?: number;
     active: boolean;
+    activeUntilMs?: number;
     secondsLeft: number;
   } | null;
   hunterProximity?: { nearby: boolean; distanceBand: 'SAFE' | 'NEAR' | 'CRITICAL' };
@@ -193,7 +196,7 @@ interface GameSnapshot {
     capturedAt: number;
   }>;
   events?: GameEventItem[];
-  soundAbility: { remainingUses: number; maxUses: number; cooldownSecondsLeft: number } | null;
+  soundAbility: { remainingUses: number; maxUses: number; cooldownSecondsLeft: number; cooldownUntilMs?: number } | null;
   recentTargetedAlert: { id: string; hunterId: string; targetHiderId: string; deliveryStatus: string; createdAt: number } | null;
   latestVoiceClip?: {
     id: string;
@@ -205,6 +208,25 @@ interface GameSnapshot {
     voiceText?: string;
     disguised: boolean;
     durationSeconds: number;
+    createdAt: number;
+  } | null;
+  latestRadioMessage?: {
+    id: string;
+    senderId: string;
+    senderName: string;
+    type: 'AUDIO' | 'TTS';
+    content: string;
+    createdAt: number;
+  } | null;
+  latestRadioCallout?: {
+    id: string;
+    senderId: string;
+    senderName: string;
+    senderRole: 'HUNTER' | 'HIDER' | null;
+    text: string;
+    disguised: boolean;
+    type?: 'TTS' | 'TAUNT';
+    tauntType?: TauntType;
     createdAt: number;
   } | null;
   recentWalkieMessages?: Array<{
@@ -305,17 +327,7 @@ const SmoothCountdownHeaderTicker = React.memo(function SmoothCountdownHeaderTic
   const targetHead = headStartEndsAtMs ?? headStartEndsAt;
   const targetGame = gameEndsAtMs ?? endsAt;
 
-  const [displaySecs, setDisplaySecs] = useState<number>(() => {
-    if (state === 'COUNTDOWN') {
-      return computeTargetRemainingSeconds(targetHead, serverTimeOffsetMs, fallbackCountdownSeconds);
-    }
-    if (state === 'PAUSED') {
-      return typeof pausedRemainingMs === 'number'
-        ? Math.max(0, Math.ceil(pausedRemainingMs / 1000))
-        : Math.max(0, Math.floor(fallbackGameSeconds));
-    }
-    return computeTargetRemainingSeconds(targetGame, serverTimeOffsetMs, fallbackGameSeconds);
-  });
+  const [displaySecs, setDisplaySecs] = useState<number>(0);
 
   const lastBeepSecRef = useRef<number | null>(null);
   const zeroTriggeredRef = useRef(false);
@@ -408,12 +420,8 @@ const RoleRevealCountdownCard = React.memo(function RoleRevealCountdownCard({
   const targetHead = headStartEndsAtMs ?? headStartEndsAt;
   const targetGame = gameEndsAtMs ?? endsAt;
 
-  const [countdownSecs, setCountdownSecs] = useState<number>(() =>
-    computeTargetRemainingSeconds(targetHead, serverTimeOffsetMs, fallbackCountdownSeconds)
-  );
-  const [gameSecs, setGameSecs] = useState<number>(() =>
-    computeTargetRemainingSeconds(targetGame, serverTimeOffsetMs, fallbackGameSeconds)
-  );
+  const [countdownSecs, setCountdownSecs] = useState<number>(fallbackCountdownSeconds);
+  const [gameSecs, setGameSecs] = useState<number>(fallbackGameSeconds);
   const lastBeepSecRef = useRef<number | null>(null);
   const zeroTriggeredRef = useRef(false);
 
@@ -510,9 +518,7 @@ const HunterLockedMapCountdownOverlay = React.memo(function HunterLockedMapCount
   onCountdownZero?: () => void;
 }) {
   const targetHead = headStartEndsAtMs ?? headStartEndsAt;
-  const [secsLeft, setSecsLeft] = useState<number>(() =>
-    computeTargetRemainingSeconds(targetHead, serverTimeOffsetMs, fallbackCountdownSeconds)
-  );
+  const [secsLeft, setSecsLeft] = useState<number>(fallbackCountdownSeconds);
   const zeroTriggeredRef = useRef(false);
 
   useEffect(() => {
@@ -555,33 +561,27 @@ export default function AuiManhuntPage() {
 }
 
 function AuiManhuntApp() {
-  const [screen, setScreen] = useState<'HOME' | 'CREATE' | 'JOIN'>(() => {
-    if (typeof window !== 'undefined') {
-      const params = new URLSearchParams(window.location.search);
-      const rawRoom = (params.get('room') || params.get('code') || '')
-        .trim()
-        .toUpperCase()
-        .replace(/[^A-Z0-9]/g, '')
-        .slice(0, 6);
-      if (rawRoom.length === 6) return 'JOIN';
-    }
-    return 'HOME';
-  });
+  const [isHydrated, setIsHydrated] = useState(false);
+  const [screen, setScreen] = useState<'HOME' | 'CREATE' | 'JOIN'>('HOME');
   const [roomCode, setRoomCode] = useState<string | null>(null);
   const [activePlayerId, setActivePlayerId] = useState<string | null>(null);
   const [knownPlayerIds, setKnownPlayerIds] = useState<string[]>([]);
   const [snapshot, setSnapshot] = useState<GameSnapshot | null>(null);
   const [dismissedRoleForPlayers, setDismissedRoleForPlayers] = useState<Record<string, boolean>>({});
   const [activeTab, setActiveTab] = useState<'players' | 'radio' | 'safety'>('players');
+  const [nowTick, setNowTick] = useState(0);
   const [sessionHydrated, setSessionHydrated] = useState(false);
+  const [lastReceivedRadio, setLastReceivedRadio] = useState<{
+    id: string;
+    senderId: string;
+    senderName: string;
+    type: 'AUDIO' | 'TTS';
+    content: string;
+    audioDataUrl?: string;
+  } | null>(null);
 
   // Setup state
-  const [createNickname, setCreateNickname] = useState(() => {
-    if (typeof window !== 'undefined') {
-      return sessionStorage.getItem('aui_manhunt_last_nick') || '';
-    }
-    return '';
-  });
+  const [createNickname, setCreateNickname] = useState('');
   const [createTitle, setCreateTitle] = useState('');
   const [selectedPresetId, setSelectedPresetId] = useState<'standard' | 'battle_royale' | 'stealth'>('standard');
   const [showAdvancedRules, setShowAdvancedRules] = useState(false);
@@ -658,23 +658,8 @@ function AuiManhuntApp() {
     }
   }, []);
 
-  const [joinCodeInput, setJoinCodeInput] = useState(() => {
-    if (typeof window !== 'undefined') {
-      const params = new URLSearchParams(window.location.search);
-      return (params.get('room') || params.get('code') || '')
-        .trim()
-        .toUpperCase()
-        .replace(/[^A-Z0-9]/g, '')
-        .slice(0, 6);
-    }
-    return '';
-  });
-  const [joinNicknameInput, setJoinNicknameInput] = useState(() => {
-    if (typeof window !== 'undefined') {
-      return sessionStorage.getItem('aui_manhunt_last_nick') || '';
-    }
-    return '';
-  });
+  const [joinCodeInput, setJoinCodeInput] = useState('');
+  const [joinNicknameInput, setJoinNicknameInput] = useState('');
   const joinNicknameInputRef = useRef<HTMLInputElement | null>(null);
   const [roomPreview, setRoomPreview] = useState<RoomPreviewInfo | null>(null);
   const [roomPreviewLoading, setRoomPreviewLoading] = useState(false);
@@ -740,12 +725,22 @@ function AuiManhuntApp() {
   const walkieTickTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const playedWalkieIdsRef = useRef<Set<string>>(new Set());
   const playedTauntIdsRef = useRef<Set<string>>(new Set());
+  const walkiePlayerRef = useRef<HTMLAudioElement | null>(null);
+  const walkieAudioUnlockedRef = useRef<boolean>(false);
+  const lastPlayedClipIdRef = useRef<string | null>(null);
+  const lastPlayedRadioCalloutIdRef = useRef<string | null>(null);
 
   // Walkie-Talkie last audio buffer for Replay Last
-  const lastRadioAudioRef = useRef<{ audioDataUrl: string; disguised: boolean } | null>(null);
+  const lastRadioAudioRef = useRef<{
+    id?: string;
+    audioDataUrl?: string;
+    voiceText?: string;
+    disguised: boolean;
+    senderName?: string;
+    senderRole?: string | null;
+  } | null>(null);
 
   // Host Lobby Settings live editing & debounce lock
-  const [hostSettingsOpen, setHostSettingsOpen] = useState(false);
   const [localLobbySettings, setLocalLobbySettings] = useState<LocalLobbySettings | null>(null);
   const localLobbySettingsRef = useRef<LocalLobbySettings | null>(null);
   const settingsMutationLockUntilRef = useRef<number>(0);
@@ -931,11 +926,131 @@ function AuiManhuntApp() {
     }
   }, [snapshot?.settings]);
 
-  // Global first-interaction AudioContext auto-unlock & state sync
+  const unlockAudioHardware = useCallback(() => {
+    soundEngine.unlockAndPlayActivationChime();
+    setSoundUnlockedLocal(true);
+    if (walkiePlayerRef.current && !walkieAudioUnlockedRef.current) {
+      try {
+        walkiePlayerRef.current.src =
+          'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+        walkiePlayerRef.current.volume = 1.0;
+        const playPromise = walkiePlayerRef.current.play();
+        if (playPromise !== undefined) {
+          playPromise
+            .then(() => {
+              walkieAudioUnlockedRef.current = true;
+              walkiePlayerRef.current?.pause();
+              if (walkiePlayerRef.current) walkiePlayerRef.current.currentTime = 0;
+            })
+            .catch(() => {});
+        }
+      } catch {}
+    }
+  }, []);
+
+  const playVoiceClipMedia = useCallback(
+    async (clip: {
+      id: string;
+      senderId?: string;
+      senderNickname?: string;
+      senderName?: string;
+      senderRole?: 'HUNTER' | 'HIDER' | null;
+      audioDataUrl?: string;
+      voiceText?: string;
+      disguised?: boolean;
+    }) => {
+      const senderName = clip.senderNickname || clip.senderName || 'Player';
+      const senderRole = clip.senderRole || 'PLAYER';
+
+      setActiveWalkieSpeaker({
+        nickname: senderName,
+        role: senderRole,
+        disguised: Boolean(clip.disguised),
+        voiceText: clip.voiceText,
+      });
+
+      soundEngine.playRadioSquelch('START');
+
+      lastRadioAudioRef.current = {
+        id: clip.id,
+        audioDataUrl: clip.audioDataUrl,
+        voiceText: clip.voiceText,
+        disguised: Boolean(clip.disguised),
+        senderName,
+        senderRole,
+      };
+
+      const finishSpeaker = () => {
+        soundEngine.playRadioSquelch('END');
+        setActiveWalkieSpeaker((prev) => (prev && prev.nickname === senderName ? null : prev));
+      };
+
+      if (clip.audioDataUrl && clip.audioDataUrl.startsWith('data:audio')) {
+        let played = false;
+        if (walkiePlayerRef.current) {
+          try {
+            const el = walkiePlayerRef.current;
+            el.src = clip.audioDataUrl;
+            el.volume = 1.0;
+            const anyAudio = el as HTMLAudioElement & {
+              preservesPitch?: boolean;
+              mozPreservesPitch?: boolean;
+              webkitPreservesPitch?: boolean;
+            };
+            if (clip.disguised) {
+              anyAudio.preservesPitch = false;
+              anyAudio.mozPreservesPitch = false;
+              anyAudio.webkitPreservesPitch = false;
+              el.playbackRate = 0.78;
+            } else {
+              anyAudio.preservesPitch = true;
+              el.playbackRate = 1.0;
+            }
+            el.onended = () => finishSpeaker();
+            el.onerror = () => {
+              if (!played) {
+                soundEngine.playWalkieTalkieAudio(clip.audioDataUrl!, Boolean(clip.disguised), finishSpeaker);
+              }
+            };
+            await el.play();
+            played = true;
+          } catch {
+            played = false;
+          }
+        }
+        if (!played) {
+          await soundEngine.playWalkieTalkieAudio(clip.audioDataUrl, Boolean(clip.disguised), finishSpeaker);
+        }
+      } else if (clip.voiceText) {
+        if ('speechSynthesis' in window) {
+          try {
+            window.speechSynthesis.cancel();
+            const utter = new SpeechSynthesisUtterance(clip.voiceText);
+            utter.lang = 'en-US';
+            utter.rate = 1.05;
+            utter.pitch = clip.disguised ? 0.6 : 1.0;
+            utter.volume = 1.0;
+            utter.onend = () => finishSpeaker();
+            utter.onerror = () => finishSpeaker();
+            window.speechSynthesis.speak(utter);
+          } catch {
+            finishSpeaker();
+          }
+        } else {
+          soundEngine.playSilentRadioTTS(clip.voiceText, Boolean(clip.disguised), finishSpeaker);
+        }
+      } else {
+        finishSpeaker();
+      }
+    },
+    []
+  );
+
+  // Global first-interaction AudioContext & <audio> persistent unlock
   useEffect(() => {
     soundEngine.registerGlobalAutoUnlock();
     const onFirstUserGesture = () => {
-      setSoundUnlockedLocal(true);
+      unlockAudioHardware();
     };
     window.addEventListener('pointerdown', onFirstUserGesture, { once: true, capture: true, passive: true });
     window.addEventListener('touchstart', onFirstUserGesture, { once: true, capture: true, passive: true });
@@ -947,7 +1062,7 @@ function AuiManhuntApp() {
       window.removeEventListener('click', onFirstUserGesture, true);
       window.removeEventListener('keydown', onFirstUserGesture, true);
     };
-  }, []);
+  }, [unlockAudioHardware]);
 
   // Isolate player session in per-tab sessionStorage and auto-read room code from URL (?room=CODE)
   useEffect(() => {
@@ -1008,8 +1123,52 @@ function AuiManhuntApp() {
       setScreen('JOIN');
     }
 
+    try {
+      const lastNick = window.sessionStorage.getItem('aui_manhunt_last_nick') || '';
+      if (lastNick) {
+        setCreateNickname(lastNick);
+        setJoinNicknameInput(lastNick);
+      }
+    } catch {}
+
     setSessionHydrated(true);
+    setIsHydrated(true);
   }, []);
+
+  useEffect(() => {
+    setIsHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    const updateTick = () => setNowTick(Date.now());
+    const timer = setInterval(updateTick, 1000);
+    const onVisibility = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        updateTick();
+      }
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('visibilitychange', onVisibility);
+      window.addEventListener('focus', onVisibility);
+    }
+    return () => {
+      clearInterval(timer);
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('visibilitychange', onVisibility);
+        window.removeEventListener('focus', onVisibility);
+      }
+    };
+  }, []);
+
+  // Auto-sync browser URL with snapshot.code whenever active room changes
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (snapshot?.code) {
+      window.history.replaceState(null, '', '/?room=' + snapshot.code);
+    } else if (screen === 'HOME' && !roomCode) {
+      window.history.replaceState(null, '', '/');
+    }
+  }, [snapshot?.code, screen, roomCode]);
 
   // Automatically fetch room preview & focus nickname field when on JOIN screen with 6-character code
   useEffect(() => {
@@ -1212,21 +1371,39 @@ function AuiManhuntApp() {
       }
     }
     const inClearGrace = Date.now() < gpsClearGraceUntilRef.current;
+    if (rawSnap.latestVoiceClip?.audioDataUrl) {
+      lastRadioAudioRef.current = {
+        audioDataUrl: rawSnap.latestVoiceClip.audioDataUrl,
+        voiceText: rawSnap.latestVoiceClip.voiceText,
+        disguised: rawSnap.latestVoiceClip.disguised,
+      };
+    } else if (rawSnap.latestVoiceClip?.voiceText) {
+      lastRadioAudioRef.current = {
+        voiceText: rawSnap.latestVoiceClip.voiceText,
+        disguised: rawSnap.latestVoiceClip.disguised,
+      };
+    }
     return {
       ...rawSnap,
       viewerGpsDenied: inClearGrace ? false : rawSnap.viewerGpsDenied,
       viewerGpsConsent: inClearGrace ? true : rawSnap.viewerGpsConsent,
+      latestVoiceClip: rawSnap.latestVoiceClip
+        ? { ...rawSnap.latestVoiceClip, audioDataUrl: undefined }
+        : rawSnap.latestVoiceClip,
       participants: rawSnap.participants.map((p: ParticipantView) => {
         let nextPr = p.photoRequest;
         if (nextPr) {
           if (nextPr.photoDataUrl) {
+            if (photoCacheRef.current.size >= 5) {
+              const firstKey = photoCacheRef.current.keys().next().value;
+              if (firstKey) photoCacheRef.current.delete(firstKey);
+            }
             photoCacheRef.current.set(nextPr.id, nextPr.photoDataUrl);
-          } else if (nextPr.hasPhoto && photoCacheRef.current.has(nextPr.id)) {
-            nextPr = {
-              ...nextPr,
-              photoDataUrl: photoCacheRef.current.get(nextPr.id) || null,
-            };
           }
+          nextPr = {
+            ...nextPr,
+            photoDataUrl: null,
+          };
         }
         return {
           ...p,
@@ -1394,6 +1571,10 @@ function AuiManhuntApp() {
             playedSpecificAlertThisCycle = true;
             soundEngine.playPhotoRequestAlert();
             if (pr.photoDataUrl) {
+              if (photoCacheRef.current.size >= 5) {
+                const firstKey = photoCacheRef.current.keys().next().value;
+                if (firstKey) photoCacheRef.current.delete(firstKey);
+              }
               photoCacheRef.current.set(pr.id, pr.photoDataUrl);
               showToast(`📷 ${p.nickname} submitted a surroundings photo! Opening intel view...`, 'info');
               setViewerPhotoModal({ nickname: p.nickname, url: pr.photoDataUrl });
@@ -1414,83 +1595,86 @@ function AuiManhuntApp() {
       }
     }
 
-    // 4. Walkie-Talkie Incoming Voice Clips & Silent Radio TTS
-    if (snapshot.latestVoiceClip) {
+    // 4. Walkie-Talkie Incoming Voice Clips & TTS Callouts
+    if (snapshot.latestVoiceClip && snapshot.latestVoiceClip.id !== lastPlayedClipIdRef.current) {
       const clip = snapshot.latestVoiceClip;
-      if (!playedWalkieIdsRef.current.has(clip.id)) {
-        playedWalkieIdsRef.current.add(clip.id);
+      lastPlayedClipIdRef.current = clip.id;
+      setLastReceivedRadio({
+        id: clip.id,
+        senderId: clip.senderId,
+        senderName: clip.senderNickname,
+        type: clip.audioDataUrl || clip.hasAudio ? 'AUDIO' : 'TTS',
+        content: clip.voiceText || '',
+        audioDataUrl: clip.audioDataUrl,
+      });
+
+      lastRadioAudioRef.current = {
+        id: clip.id,
+        audioDataUrl: clip.audioDataUrl,
+        voiceText: clip.voiceText,
+        disguised: clip.disguised,
+        senderName: clip.senderNickname,
+        senderRole: clip.senderRole,
+      };
+
+      if (clip.senderId === activePlayerId) {
+        soundEngine.playRadioSquelch('END');
+      } else {
         playedSpecificAlertThisCycle = true;
-        const roleLabel = clip.senderRole || 'PLAYER';
-        setActiveWalkieSpeaker({
-          nickname: clip.senderNickname,
-          role: roleLabel,
-          disguised: clip.disguised,
-          voiceText: clip.voiceText,
-        });
-        const onEnd = () => {
-          setActiveWalkieSpeaker((prev) =>
-            prev && prev.nickname === clip.senderNickname ? null : prev
-          );
-        };
-        if (clip.audioDataUrl) {
-          lastRadioAudioRef.current = {
-            audioDataUrl: clip.audioDataUrl,
-            disguised: clip.disguised,
-          };
-          soundEngine.playWalkieTalkieAudio(clip.audioDataUrl, clip.disguised, onEnd);
-        } else if (clip.hasAudio && snapshot.code) {
-          fetch(`/api/games?code=${encodeURIComponent(snapshot.code)}&clipId=${encodeURIComponent(clip.id)}`)
-            .then((r) => r.json())
-            .then((data) => {
-              if (data?.clip?.audioDataUrl) {
-                lastRadioAudioRef.current = {
-                  audioDataUrl: data.clip.audioDataUrl,
-                  disguised: clip.disguised,
-                };
-                soundEngine.playWalkieTalkieAudio(data.clip.audioDataUrl, clip.disguised, onEnd);
-              }
-            })
-            .catch(() => {});
-        } else if (clip.voiceText) {
-          soundEngine.playSilentRadioTTS(clip.voiceText, clip.disguised, onEnd);
-        }
+        playVoiceClipMedia(clip);
       }
-    } else if (snapshot.recentWalkieMessages && snapshot.recentWalkieMessages.length > 0) {
-      for (const msg of snapshot.recentWalkieMessages) {
-        if (!playedWalkieIdsRef.current.has(msg.id)) {
-          playedWalkieIdsRef.current.add(msg.id);
-          playedSpecificAlertThisCycle = true;
-          const roleLabel = msg.senderRole || 'PLAYER';
-          setActiveWalkieSpeaker({
-            nickname: msg.senderNickname,
-            role: roleLabel,
-            disguised: msg.disguised,
-          });
-          const onMsgEnd = () => {
-            setActiveWalkieSpeaker((prev) =>
-              prev && prev.nickname === msg.senderNickname ? null : prev
-            );
-          };
-          if (msg.audioDataUrl) {
-            lastRadioAudioRef.current = {
-              audioDataUrl: msg.audioDataUrl,
-              disguised: msg.disguised,
+    } else if (snapshot.latestRadioCallout && snapshot.latestRadioCallout.id !== lastPlayedRadioCalloutIdRef.current) {
+      const callout = snapshot.latestRadioCallout;
+      lastPlayedRadioCalloutIdRef.current = callout.id;
+      setLastReceivedRadio({
+        id: callout.id,
+        senderId: callout.senderId,
+        senderName: callout.senderName,
+        type: 'TTS',
+        content: callout.text,
+      });
+      lastRadioAudioRef.current = {
+        id: callout.id,
+        voiceText: callout.text,
+        disguised: callout.disguised,
+        senderName: callout.senderName,
+        senderRole: callout.senderRole,
+      };
+
+      if (callout.senderId !== activePlayerId) {
+        playedSpecificAlertThisCycle = true;
+        soundEngine.playRadioSquelch('START');
+        setActiveWalkieSpeaker({
+          nickname: callout.senderName,
+          role: callout.senderRole || 'PLAYER',
+          disguised: callout.disguised,
+          voiceText: callout.text,
+        });
+        if ('speechSynthesis' in window) {
+          try {
+            window.speechSynthesis.cancel();
+            const utter = new SpeechSynthesisUtterance(callout.text);
+            utter.lang = 'en-US';
+            utter.rate = 1.05;
+            utter.pitch = callout.disguised ? 0.6 : 1.0;
+            utter.volume = 1.0;
+            utter.onend = () => {
+              soundEngine.playRadioSquelch('END');
+              setActiveWalkieSpeaker((prev) => (prev && prev.nickname === callout.senderName ? null : prev));
             };
-            soundEngine.playWalkieTalkieAudio(msg.audioDataUrl, msg.disguised, onMsgEnd);
-          } else if (msg.hasAudio && snapshot.code) {
-            fetch(`/api/games?code=${encodeURIComponent(snapshot.code)}&clipId=${encodeURIComponent(msg.id)}`)
-              .then((r) => r.json())
-              .then((data) => {
-                if (data?.clip?.audioDataUrl) {
-                  lastRadioAudioRef.current = {
-                    audioDataUrl: data.clip.audioDataUrl,
-                    disguised: msg.disguised,
-                  };
-                  soundEngine.playWalkieTalkieAudio(data.clip.audioDataUrl, msg.disguised, onMsgEnd);
-                }
-              })
-              .catch(() => {});
+            utter.onerror = () => {
+              soundEngine.playRadioSquelch('END');
+              setActiveWalkieSpeaker((prev) => (prev && prev.nickname === callout.senderName ? null : prev));
+            };
+            window.speechSynthesis.speak(utter);
+          } catch {
+            soundEngine.playRadioSquelch('END');
+            setActiveWalkieSpeaker((prev) => (prev && prev.nickname === callout.senderName ? null : prev));
           }
+        } else {
+          soundEngine.playSilentRadioTTS(callout.text, callout.disguised, () => {
+            setActiveWalkieSpeaker((prev) => (prev && prev.nickname === callout.senderName ? null : prev));
+          });
         }
       }
     }
@@ -1508,6 +1692,27 @@ function AuiManhuntApp() {
             `${meta?.emoji || '📣'} [${taunt.senderNickname} - ${roleLabel}]: ${meta?.label || taunt.tauntType}`,
             'warning'
           );
+
+          if (taunt.senderId !== activePlayerId) {
+            const tauntSpeechMap: Record<TauntType, string> = {
+              CATCH_ME: 'Catch me if you can!',
+              I_SEE_YOU: 'I see you!',
+              AIRHORN: 'Airhorn!',
+              TOO_SLOW: 'Too slow!',
+            };
+            const speechText = tauntSpeechMap[taunt.tauntType] || meta?.label || 'Taunt!';
+            if ('speechSynthesis' in window) {
+              try {
+                window.speechSynthesis.cancel();
+                const utter = new SpeechSynthesisUtterance(speechText);
+                utter.lang = 'en-US';
+                utter.rate = 1.1;
+                utter.pitch = 1.2;
+                utter.volume = 1.0;
+                window.speechSynthesis.speak(utter);
+              } catch {}
+            }
+          }
         }
       }
     }
@@ -1540,28 +1745,39 @@ function AuiManhuntApp() {
         }
       }
     }
-  }, [snapshot, activePlayerId, showToast, triggerEventBanner]);
+  }, [snapshot, activePlayerId, showToast, triggerEventBanner, playVoiceClipMedia]);
 
   // Proximity Heartbeat Radar for Hiders when a Hunter is < 40m away
+  // Guarded against weak GPS fixes (accuracy > 45m) on the local device to avoid false alarms.
+  const activeMe = snapshot?.participants.find((p) => p.id === activePlayerId) || null;
+  const localGpsAccuracyOk =
+    (activeMe?.location?.accuracy !== undefined ? activeMe.location.accuracy <= 45 : true) &&
+    (localGpsFix?.accuracy !== undefined ? localGpsFix.accuracy <= 45 : true) &&
+    Boolean(activeMe?.location || localGpsFix);
   useEffect(() => {
     if (
       !snapshot ||
       snapshot.state !== 'ACTIVE' ||
       snapshot.viewerRole !== 'HIDER' ||
-      !snapshot.hunterProximity?.nearby
+      !snapshot.hunterProximity?.nearby ||
+      !localGpsAccuracyOk
     ) {
       return;
     }
     const band = snapshot.hunterProximity.distanceBand === 'CRITICAL' ? 'CRITICAL' : 'NEAR';
     soundEngine.playHeartbeatPulse(band);
-    const intervalMs = band === 'CRITICAL' ? 950 : 2000;
+    const intervalMs = band === 'CRITICAL' ? 900 : 1800;
     const hbTimer = setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        soundEngine.playHeartbeatPulse(band);
-      }
+      soundEngine.playHeartbeatPulse(band);
     }, intervalMs);
     return () => clearInterval(hbTimer);
-  }, [snapshot?.state, snapshot?.viewerRole, snapshot?.hunterProximity?.nearby, snapshot?.hunterProximity?.distanceBand]);
+  }, [
+    snapshot?.state,
+    snapshot?.viewerRole,
+    snapshot?.hunterProximity?.nearby,
+    snapshot?.hunterProximity?.distanceBand,
+    localGpsAccuracyOk,
+  ]);
 
   const handleBrowserGpsDenied = useCallback(
     async (code: string, pid: string, showDeniedToast = true) => {
@@ -2094,6 +2310,12 @@ function AuiManhuntApp() {
       showToast(msg, 'error');
       return;
     }
+    if (containsProfanity(cleanNick)) {
+      const msg = 'Please choose an appropriate nickname.';
+      setCreateError(msg);
+      showToast(msg, 'error');
+      return;
+    }
     if (typeof window !== 'undefined') {
       sessionStorage.setItem('aui_manhunt_last_nick', cleanNick);
     }
@@ -2138,7 +2360,7 @@ function AuiManhuntApp() {
       seededEventsGameIdRef.current = null;
       setRoomCode(data.code);
       if (typeof window !== 'undefined') {
-        window.history.replaceState(null, '', `/?room=${encodeURIComponent(data.code)}`);
+        window.history.replaceState(null, '', '/?room=' + data.code);
       }
       setActivePlayerId(data.participantId);
       setKnownPlayerIds([data.participantId]);
@@ -2173,6 +2395,12 @@ function AuiManhuntApp() {
       showToast(msg, 'error');
       return;
     }
+    if (containsProfanity(cleanNick)) {
+      const msg = 'Please choose an appropriate nickname.';
+      setJoinError(msg);
+      showToast(msg, 'error');
+      return;
+    }
     if (typeof window !== 'undefined') {
       sessionStorage.setItem('aui_manhunt_last_nick', cleanNick);
     }
@@ -2203,7 +2431,7 @@ function AuiManhuntApp() {
       seededEventsGameIdRef.current = null;
       setRoomCode(data.code);
       if (typeof window !== 'undefined') {
-        window.history.replaceState(null, '', `/?room=${encodeURIComponent(data.code)}`);
+        window.history.replaceState(null, '', '/?room=' + data.code);
       }
       setActivePlayerId(data.participantId);
       setKnownPlayerIds([data.participantId]);
@@ -2283,6 +2511,7 @@ function AuiManhuntApp() {
               maxUses,
               remainingUses,
               active: true,
+              activeUntilMs: Date.now() + 60000,
               secondsLeft: 60,
             },
             participants: prev.participants.map((p) =>
@@ -2453,26 +2682,18 @@ function AuiManhuntApp() {
   }
 
   function handleUnlockAudio() {
-    const ok = soundEngine.unlockAndPlayActivationChime();
-    if (ok) {
-      setSoundUnlockedLocal(true);
-      dispatchGameAction({ action: 'UNLOCK_AUDIO' }, 'Sound Active 🔊 — Activation chime played!');
-    } else {
-      showToast('Browser blocked audio initialization. Check silent mode switch.', 'error');
-    }
+    unlockAudioHardware();
+    setSoundUnlockedLocal(true);
+    dispatchGameAction({ action: 'UNLOCK_AUDIO' }, 'Sound Active 🔊 — Activation chime played!');
   }
 
   function handleTestSound() {
-    const ok = soundEngine.unlockAndPlayActivationChime();
-    if (ok) {
-      setSoundUnlockedLocal(true);
-      if (!snapshot?.viewerAudioUnlocked) {
-        dispatchGameAction({ action: 'UNLOCK_AUDIO' });
-      }
-      showToast('🔊 Test chime played! Your device audio is working.', 'info');
-    } else {
-      showToast('Could not play test sound. Check device volume / mute switch.', 'error');
+    unlockAudioHardware();
+    setSoundUnlockedLocal(true);
+    if (!snapshot?.viewerAudioUnlocked) {
+      dispatchGameAction({ action: 'UNLOCK_AUDIO' });
     }
+    showToast('🔊 Test chime played! Your device audio is working.', 'info');
   }
 
   function cleanupWalkieRecorder() {
@@ -2568,6 +2789,18 @@ function AuiManhuntApp() {
           );
           if (res?.messageId) {
             playedWalkieIdsRef.current.add(res.messageId);
+            setLastReceivedRadio({
+              id: res.messageId,
+              senderId: activePlayerId || '',
+              senderName: me?.nickname || 'You',
+              type: 'AUDIO',
+              content: '',
+              audioDataUrl: base64Url,
+            });
+            lastRadioAudioRef.current = {
+              audioDataUrl: base64Url,
+              disguised: walkieDisguised,
+            };
             soundEngine.playRadioSquelch('END');
           }
         };
@@ -2631,64 +2864,49 @@ function AuiManhuntApp() {
     );
     if (res?.messageId) {
       playedWalkieIdsRef.current.add(res.messageId);
+      setLastReceivedRadio({
+        id: res.messageId,
+        senderId: activePlayerId || '',
+        senderName: me?.nickname || 'You',
+        type: 'TTS',
+        content: textToSend,
+      });
+      lastRadioAudioRef.current = {
+        voiceText: textToSend,
+        disguised: walkieDisguised,
+      };
       soundEngine.playSilentRadioTTS(textToSend, walkieDisguised);
     }
   }
 
   const handleReplayLastRadioMessage = useCallback(async () => {
-    if (!snapshot?.latestVoiceClip && !lastRadioAudioRef.current) {
-      showToast('No radio messages received yet in this match.', 'info');
-      return;
-    }
-    setSoundUnlockedLocal(true);
+    unlockAudioHardware();
     const clip = snapshot?.latestVoiceClip;
-    const roleLabel = clip?.senderRole || 'PLAYER';
-    setActiveWalkieSpeaker({
-      nickname: clip?.senderNickname || 'Player',
-      role: roleLabel,
-      disguised: clip?.disguised || lastRadioAudioRef.current?.disguised || false,
-      voiceText: clip?.voiceText,
-    });
-    const onEnd = () => {
-      setActiveWalkieSpeaker((prev) =>
-        prev && prev.nickname === (clip?.senderNickname || 'Player') ? null : prev
-      );
-    };
+    const callout = snapshot?.latestRadioCallout;
+    const radioMeta = snapshot?.latestRadioMessage || lastReceivedRadio;
+    const saved = lastRadioAudioRef.current;
 
-    if (lastRadioAudioRef.current?.audioDataUrl) {
-      await soundEngine.playWalkieTalkieAudio(
-        lastRadioAudioRef.current.audioDataUrl,
-        lastRadioAudioRef.current.disguised,
-        onEnd
-      );
-      showToast('Replaying last radio transmission 📻');
+    const audioUrl = clip?.audioDataUrl || saved?.audioDataUrl;
+    const voiceText = clip?.voiceText || callout?.text || radioMeta?.content || saved?.voiceText;
+    const disguised = clip?.disguised || callout?.disguised || saved?.disguised || false;
+    const senderName = clip?.senderNickname || callout?.senderName || radioMeta?.senderName || saved?.senderName || 'Radio';
+    const senderRole = clip?.senderRole || callout?.senderRole || (saved?.senderRole as any) || 'PLAYER';
+
+    if (!audioUrl && !voiceText) {
+      showToast('No radio messages recorded yet in this match.', 'info');
       return;
     }
 
-    if (clip?.audioDataUrl) {
-      lastRadioAudioRef.current = { audioDataUrl: clip.audioDataUrl, disguised: clip.disguised };
-      await soundEngine.playWalkieTalkieAudio(clip.audioDataUrl, clip.disguised, onEnd);
-      showToast('Replaying last radio transmission 📻');
-    } else if (clip?.hasAudio && snapshot?.code) {
-      try {
-        const res = await fetch(`/api/games?code=${encodeURIComponent(snapshot.code)}&clipId=${encodeURIComponent(clip.id)}`);
-        const data = await res.json();
-        if (data?.clip?.audioDataUrl) {
-          lastRadioAudioRef.current = { audioDataUrl: data.clip.audioDataUrl, disguised: clip.disguised };
-          await soundEngine.playWalkieTalkieAudio(data.clip.audioDataUrl, clip.disguised, onEnd);
-          showToast('Replaying last radio transmission 📻');
-          return;
-        }
-      } catch {}
-      if (clip.voiceText) {
-        await soundEngine.playSilentRadioTTS(clip.voiceText, clip.disguised, onEnd);
-        showToast('Replaying last radio transmission 📻');
-      }
-    } else if (clip?.voiceText) {
-      await soundEngine.playSilentRadioTTS(clip.voiceText, clip.disguised, onEnd);
-      showToast('Replaying last radio transmission 📻');
-    }
-  }, [snapshot?.latestVoiceClip, snapshot?.code, showToast]);
+    showToast('Replaying last radio transmission 📻');
+    await playVoiceClipMedia({
+      id: clip?.id || callout?.id || 'replay',
+      senderNickname: senderName,
+      senderRole,
+      audioDataUrl: audioUrl,
+      voiceText,
+      disguised,
+    });
+  }, [snapshot?.latestVoiceClip, snapshot?.latestRadioCallout, snapshot?.latestRadioMessage, lastReceivedRadio, playVoiceClipMedia, showToast, unlockAudioHardware]);
 
   const handleUpdateLobbySetting = useCallback(
     <K extends keyof LocalLobbySettings>(key: K, value: LocalLobbySettings[K]) => {
@@ -2989,17 +3207,23 @@ function AuiManhuntApp() {
     if (!snapshot || isHunterMapLocked) return [];
     const rawList = snapshot.participants
       .filter((p) => p.location !== null && (p.id === activePlayerId || snapshot.state !== 'COUNTDOWN'))
-      .map((p) => ({
-        id: p.id,
-        nickname: p.nickname,
-        role: p.role,
-        isSelf: p.id === activePlayerId,
-        lat: p.location!.lat,
-        lng: p.location!.lng,
-        accuracy: p.location!.accuracy,
-        ageSeconds: p.location!.ageSeconds,
-        isStale: p.location!.isStale,
-      }));
+      .map((p) => {
+        const ageSeconds = p.location!.updatedAt
+          ? Math.max(0, Math.round((nowTick - p.location!.updatedAt) / 1000))
+          : p.location!.ageSeconds;
+        const staleThreshold = Math.max(45, (snapshot.settings.gpsIntervalSeconds || 60) + 15);
+        return {
+          id: p.id,
+          nickname: p.nickname,
+          role: p.role,
+          isSelf: p.id === activePlayerId,
+          lat: p.location!.lat,
+          lng: p.location!.lng,
+          accuracy: p.location!.accuracy,
+          ageSeconds,
+          isStale: ageSeconds > staleThreshold,
+        };
+      });
 
     // Detect overlapping coordinates and apply ~3.5m radial offset so pins never obscure each other
     const clusters: Array<typeof rawList> = [];
@@ -3038,7 +3262,7 @@ function AuiManhuntApp() {
     });
 
     return adjusted;
-  }, [snapshot?.participants, snapshot?.state, isHunterMapLocked, activePlayerId]);
+  }, [snapshot?.participants, snapshot?.state, snapshot?.settings.gpsIntervalSeconds, isHunterMapLocked, activePlayerId, nowTick]);
 
   const gameplayBoundary = useMemo(
     () =>
@@ -3122,42 +3346,65 @@ function AuiManhuntApp() {
       }
       return { label: '🧭 Searching...', tone: 'neutral' as const };
     } else {
+      const vis = snapshot.settings.hunterVisibilityMode || 'ALWAYS_LIVE';
+      const prox = snapshot.hunterProximity;
+      if (prox?.nearby && localGpsAccuracyOk) {
+        if (vis === 'HIDDEN') {
+          return {
+            label: '⚠️ حذر: يوجد صياد قريب منك!',
+            tone: prox.distanceBand === 'CRITICAL' ? ('critical' as const) : ('warning' as const),
+          };
+        }
+        return {
+          label:
+            prox.distanceBand === 'CRITICAL'
+              ? '🚨 Hunter Nearby! (Danger Close)'
+              : '⚠️ Hunter Nearby! (Approaching)',
+          tone: prox.distanceBand === 'CRITICAL' ? ('critical' as const) : ('warning' as const),
+        };
+      }
+      const myAccuracyOk = (myLoc.accuracy ?? 999) <= 45;
       const huntersWithLoc = snapshot.participants.filter(
-        (p) => p.role === 'HUNTER' && p.location
+        (p) => p.role === 'HUNTER' && p.location && (p.location.accuracy ?? 999) <= 45
       );
-      if (huntersWithLoc.length > 0) {
+      if (vis === 'ALWAYS_LIVE' && myAccuracyOk && huntersWithLoc.length > 0) {
         let minDistance = Infinity;
-        let closestHunter: ParticipantView | null = null;
         for (const h of huntersWithLoc) {
           const d = calculateDistanceMeters(myLoc.lat, myLoc.lng, h.location!.lat, h.location!.lng);
-          if (d < minDistance) {
-            minDistance = d;
-            closestHunter = h;
-          }
+          if (d < minDistance) minDistance = d;
         }
-        if (closestHunter) {
-          const dist = Math.round(minDistance);
-          const showRawMeters = snapshot.settings.hunterVisibilityMode === 'ALWAYS_LIVE';
-          if (dist <= 20) {
-            return {
-              label: showRawMeters ? `🚨 Hunter nearby: ${dist}m!` : '🚨 Hunter: Danger Close!',
-              tone: 'critical' as const,
-            };
-          } else if (dist <= 40) {
-            return {
-              label: showRawMeters ? `⚠️ Hunter: ${dist}m` : '⚠️ Hunter: Approaching Area',
-              tone: 'warning' as const,
-            };
-          }
-          return {
-            label: showRawMeters ? `🧭 Hunter: ${dist}m` : '🛡️ Radar: Area Clear',
-            tone: 'safe' as const,
-          };
+        const dist = Math.round(minDistance);
+        if (dist <= 20) {
+          return { label: `🚨 Hunter: ${dist}m (Danger Close)`, tone: 'critical' as const };
+        }
+        if (dist <= 40) {
+          return { label: `⚠️ Hunter: ${dist}m (Approaching)`, tone: 'warning' as const };
         }
       }
       return { label: '🛡️ Radar: Safe', tone: 'safe' as const };
     }
-  }, [snapshot, me?.location, localGpsFix, isHunter]);
+  }, [snapshot, me?.location, localGpsFix, isHunter, localGpsAccuracyOk]);
+
+  if (!isHydrated) {
+    return (
+      <div className="min-h-screen w-full flex items-center justify-center bg-canvas text-ink" dir="ltr">
+        <div className="flex flex-col items-center justify-center space-y-4 p-6 text-center">
+          <div className="w-12 h-12 rounded-2xl bg-cedar flex items-center justify-center text-white shadow-md animate-pulse">
+            <svg className="w-6 h-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="9" />
+              <polygon points="15.5 8.5 13.5 13.5 8.5 15.5 10.5 10.5 15.5 8.5" fill="currentColor" stroke="none" />
+            </svg>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-4 h-4 border-2 border-cedar border-t-transparent rounded-full animate-spin" />
+            <span className="font-display font-bold text-sm tracking-tight text-ink">
+              Loading AUI Manhunt...
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen w-full flex flex-col bg-canvas text-ink" dir="ltr">
@@ -3326,7 +3573,16 @@ function AuiManhuntApp() {
                 <span className="text-xs font-semibold uppercase tracking-wider text-cedar">Host Setup</span>
                 <h2 className="font-display font-bold text-2xl text-ink">Create a Game</h2>
               </div>
-              <button type="button" onClick={() => setScreen('HOME')} className="btn-secondary px-3.5 py-2 rounded-xl text-xs font-semibold">
+              <button
+                type="button"
+                onClick={() => {
+                  if (typeof window !== 'undefined') {
+                    window.history.replaceState(null, '', '/');
+                  }
+                  setScreen('HOME');
+                }}
+                className="btn-secondary px-3.5 py-2 rounded-xl text-xs font-semibold"
+              >
                 Back
               </button>
             </div>
@@ -3785,6 +4041,9 @@ function AuiManhuntApp() {
                   type="button"
                   onClick={() => {
                     setJoinError(null);
+                    if (typeof window !== 'undefined') {
+                      window.history.replaceState(null, '', '/');
+                    }
                     setScreen('HOME');
                   }}
                   className="btn-secondary px-3 py-1.5 rounded-xl text-xs font-semibold"
@@ -4008,15 +4267,11 @@ function AuiManhuntApp() {
                 };
 
                 return (
-                  <div className="mt-4 pt-4 border-t border-stoneline">
-                    <button
-                      type="button"
-                      onClick={() => setHostSettingsOpen((prev) => !prev)}
-                      className="w-full flex items-center justify-between p-3 rounded-xl bg-canvas border border-stoneline hover:bg-canvas-subtle transition-colors text-left"
-                    >
+                  <details className="mt-4 pt-4 border-t border-stoneline group">
+                    <summary className="w-full flex items-center justify-between p-3 rounded-xl bg-canvas border border-stoneline hover:bg-canvas-subtle transition-colors text-left cursor-pointer list-none">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-xs font-bold text-cedar uppercase tracking-wider flex items-center gap-1.5">
-                          ⚙️ Host Settings (Live Rules)
+                          ⚙️ إعدادات اللعبة المتقدمة (Host Settings)
                         </span>
                         {lobbySettingsSaveStatus === 'saving' && (
                           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-50 text-amber-800 border border-amber-200">
@@ -4030,13 +4285,13 @@ function AuiManhuntApp() {
                         )}
                       </div>
                       <div className="flex items-center gap-1.5 text-xs text-ink-muted">
-                        <span>{hostSettingsOpen ? 'Hide Rules' : 'Customize 12 Rules'}</span>
-                        <span className="text-xs font-bold">{hostSettingsOpen ? '▲' : '▼'}</span>
+                        <span>Customize 12 Rules</span>
+                        <span className="text-xs font-bold group-open:hidden">▼</span>
+                        <span className="text-xs font-bold hidden group-open:inline">▲</span>
                       </div>
-                    </button>
+                    </summary>
 
-                    {hostSettingsOpen && (
-                      <div className="mt-3 p-3.5 rounded-xl bg-canvas-subtle border border-stoneline space-y-3">
+                    <div className="mt-3 p-3.5 rounded-xl bg-canvas-subtle border border-stoneline space-y-3">
                         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5 text-xs">
                       <div>
                         <label className="block font-semibold text-ink-secondary mb-1">Number of Hunters</label>
@@ -4209,8 +4464,7 @@ function AuiManhuntApp() {
                           </div>
                         )}
                       </div>
-                    )}
-                  </div>
+                  </details>
                 );
               })()}
             </div>
@@ -4438,10 +4692,11 @@ function AuiManhuntApp() {
                     <span className="text-2xl shrink-0">📻</span>
                     <div>
                       <strong className="font-display font-extrabold text-sm sm:text-base text-white block">
-                        [{activeWalkieSpeaker.nickname} - {activeWalkieSpeaker.role}]: {activeWalkieSpeaker.voiceText ? `"${activeWalkieSpeaker.voiceText}"` : 'is speaking on Walkie-Talkie...'}
+                        Incoming Walkie-Talkie from {activeWalkieSpeaker.nickname} ({activeWalkieSpeaker.role})
                       </strong>
                       <span className="text-xs text-indigo-200 font-medium">
-                        {activeWalkieSpeaker.disguised ? '🕵️ Voice Disguise Filter Active • Live Radio Channel' : 'Live Campus Radio Transmission'}
+                        {activeWalkieSpeaker.voiceText ? `"${activeWalkieSpeaker.voiceText}" • ` : ''}
+                        {activeWalkieSpeaker.disguised ? '🕵️ Voice Disguise Active • Live Radio Channel' : 'Live Campus Radio Transmission'}
                       </span>
                     </div>
                   </div>
@@ -4449,9 +4704,9 @@ function AuiManhuntApp() {
                     <button
                       type="button"
                       onClick={handleReplayLastRadioMessage}
-                      className="px-2.5 py-1 rounded-xl bg-indigo-800 hover:bg-indigo-700 text-white font-bold text-xs flex items-center gap-1 transition-all"
+                      className="px-3 py-1.5 rounded-xl bg-indigo-800 hover:bg-indigo-700 text-white font-bold text-xs flex items-center gap-1.5 transition-all shadow-sm"
                     >
-                      🔊 Replay Last Radio
+                      🔊 Play / Replay
                     </button>
                     <span className="px-2.5 py-1 rounded-full bg-indigo-600 text-white font-mono text-[11px] font-bold uppercase shrink-0">
                       ON AIR
@@ -4460,7 +4715,7 @@ function AuiManhuntApp() {
                 </div>
               )}
 
-              {!isHunter && snapshot.state === 'ACTIVE' && snapshot.hunterProximity?.nearby && (
+              {!isHunter && snapshot.state === 'ACTIVE' && snapshot.hunterProximity?.nearby && localGpsAccuracyOk && (
                 <div
                   style={{ backgroundColor: '#450a0a', color: '#ffffff' }}
                   className="p-4 rounded-2xl bg-red-950 text-white border-2 border-red-500 shadow-lg flex items-center justify-between gap-3 animate-pulse"
@@ -4469,12 +4724,16 @@ function AuiManhuntApp() {
                     <span className="text-2xl shrink-0">💓 ⚠️</span>
                     <div>
                       <strong className="font-display font-extrabold text-base sm:text-lg text-white block uppercase tracking-wide">
-                        {snapshot.settings.hunterVisibilityMode === 'ALWAYS_LIVE'
-                          ? `Hunter Nearby! (${snapshot.hunterProximity.distanceBand === 'CRITICAL' ? '< 20m' : '< 40m'})`
-                          : `Hunter Nearby! (${snapshot.hunterProximity.distanceBand === 'CRITICAL' ? 'Danger: Critical' : 'Approaching Area'})`}
+                        {snapshot.settings.hunterVisibilityMode === 'HIDDEN'
+                          ? '⚠️ حذر: يوجد صياد قريب منك!'
+                          : snapshot.hunterProximity.distanceBand === 'CRITICAL'
+                          ? 'Hunter Nearby! (Danger Close)'
+                          : 'Hunter Nearby! (Approaching)'}
                       </strong>
                       <span className="text-xs sm:text-sm text-red-100 font-medium block mt-0.5">
-                        {snapshot.hunterProximity.distanceBand === 'CRITICAL'
+                        {snapshot.settings.hunterVisibilityMode === 'HIDDEN'
+                          ? 'Proximity Heartbeat is active. Hunter location is hidden by host settings.'
+                          : snapshot.hunterProximity.distanceBand === 'CRITICAL'
                           ? 'A Hunter is dangerously close! Move away or activate your Ghost Cloak!'
                           : 'Proximity Heartbeat Radar detected a Hunter approaching your area.'}
                       </span>
@@ -4651,13 +4910,41 @@ function AuiManhuntApp() {
                       )}
                     </div>
 
-                    {snapshot.viewerGhostCloak?.active && (
-                      <div className="ml-auto">
-                        <span className="px-3 py-1 rounded-xl bg-purple-900 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm animate-pulse">
-                          <span>👻 Ghost Cloak Active ({snapshot.viewerGhostCloak.secondsLeft}s left)</span>
-                        </span>
-                      </div>
-                    )}
+                    {(() => {
+                      const cloakUntil = snapshot.viewerGhostCloak?.activeUntilMs || 0;
+                      const cloakLeft = cloakUntil > nowTick
+                        ? Math.max(0, Math.ceil((cloakUntil - nowTick) / 1000))
+                        : snapshot.viewerGhostCloak?.active
+                        ? snapshot.viewerGhostCloak.secondsLeft
+                        : 0;
+                      const cloakActive = cloakLeft > 0;
+                      const cloakUsed = Boolean(snapshot.viewerGhostCloak?.used);
+                      return (
+                        <div className="ml-auto flex items-center gap-2">
+                          {cloakActive ? (
+                            <span className="px-3 py-1 rounded-xl bg-purple-900 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm animate-pulse">
+                              <span>👻 Ghost Cloak Active ({cloakLeft}s left)</span>
+                            </span>
+                          ) : !cloakUsed ? (
+                            <button
+                              type="button"
+                              disabled={snapshot.state !== 'ACTIVE' || me?.status !== 'ACTIVE'}
+                              onClick={() => {
+                                soundEngine.playGhostCloakTone();
+                                dispatchGameAction({ action: 'ACTIVATE_GHOST_CLOAK' }, '👻 Ghost Cloak Activated for 60s!');
+                              }}
+                              className="min-h-[36px] px-3 py-1 rounded-xl bg-purple-800 hover:bg-purple-900 text-white font-bold text-xs disabled:opacity-40"
+                            >
+                              👻 Activate Ghost Cloak
+                            </button>
+                          ) : (
+                            <span className="px-3 py-1 rounded-xl bg-stone-200 text-stone-700 font-semibold text-xs">
+                              👻 Ghost Cloak used
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </div>
                 )}
               </div>
@@ -4706,7 +4993,9 @@ function AuiManhuntApp() {
                         : '🔄 Searching GPS...'}
                     </span>
                     {me?.location && (
-                      <span className="text-ink-muted font-mono text-[11px] shrink-0">• {me.location.ageSeconds}s</span>
+                      <span className="text-ink-muted font-mono text-[11px] shrink-0">
+                        • {me.location.updatedAt ? Math.max(0, Math.round((nowTick - me.location.updatedAt) / 1000)) : me.location.ageSeconds}s
+                      </span>
                     )}
                   </div>
                 </div>
@@ -4798,49 +5087,17 @@ function AuiManhuntApp() {
                           }`}
                         >
                           <span>⚙️</span>
-                          <span className="truncate">Safety</span>
+                          <span className="truncate">Safety &amp; Host</span>
                         </button>
                       </div>
 
                       {/* TAB 1: RADIO & TOOLS */}
                       {effectiveTab === 'radio' && isRadioEnabled && (
-                        <div className="space-y-4">
+                        <div className="space-y-3">
                           {/* Minimalist Radio Section */}
                           <div className="p-3.5 rounded-xl bg-canvas border border-stoneline space-y-3">
-                            <div className="flex flex-wrap items-center justify-between gap-2">
-                              <div>
-                                <h4 className="font-display font-bold text-xs sm:text-sm text-ink flex items-center gap-1.5">
-                                  <span>📻</span> Campus Radio &amp; Walkie-Talkie
-                                </h4>
-                                <p className="text-[11px] text-ink-muted">
-                                  Hold to speak or tap a role callout to broadcast across all phones
-                                </p>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <button
-                                  type="button"
-                                  onClick={() => setWalkieDisguised((prev) => !prev)}
-                                  className={`min-h-[36px] px-3 py-1 rounded-xl text-xs font-bold border transition flex items-center gap-1.5 ${
-                                    walkieDisguised
-                                      ? 'bg-purple-900 text-white border-purple-700 shadow-sm'
-                                      : 'bg-white text-ink-secondary border-stoneline hover:bg-subtle'
-                                  }`}
-                                >
-                                  <span>🕵️ Voice Disguise: {walkieDisguised ? 'ON' : 'OFF'}</span>
-                                </button>
-                                <button
-                                  type="button"
-                                  disabled={!snapshot.latestVoiceClip && !lastRadioAudioRef.current}
-                                  onClick={handleReplayLastRadioMessage}
-                                  className="btn-secondary min-h-[36px] px-3 py-1 rounded-xl text-xs font-bold flex items-center gap-1.5 disabled:opacity-40"
-                                >
-                                  <span>🔊 Replay Last Radio</span>
-                                </button>
-                              </div>
-                            </div>
-
-                            {/* Primary Hold to Talk Button */}
-                            <div>
+                            {/* Top Row: Hold to Talk, Voice Disguise, Replay Last Radio */}
+                            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
                               <button
                                 type="button"
                                 onPointerDown={(e) => {
@@ -4859,19 +5116,42 @@ function AuiManhuntApp() {
                                     stopWalkieTalkieRecording();
                                   }
                                 }}
-                                className={`w-full min-h-[50px] px-5 py-3 rounded-2xl font-display font-extrabold text-sm sm:text-base transition flex items-center justify-center gap-2 shadow-sm select-none ${
+                                className={`flex-1 min-h-[46px] px-4 py-2.5 rounded-xl font-display font-extrabold text-xs sm:text-sm transition flex items-center justify-center gap-2 shadow-sm select-none ${
                                   walkieRecording
                                     ? 'bg-red-600 text-white animate-pulse ring-4 ring-red-300'
                                     : 'bg-indigo-900 hover:bg-indigo-950 text-white active:scale-[0.99]'
                                 }`}
                               >
-                                <span>{walkieRecording ? '🔴 Transmitting Voice Radio...' : '🎙️ Hold to Talk (Walkie-Talkie)'}</span>
+                                <span>{walkieRecording ? '🔴 Transmitting Voice...' : '🎙️ Hold to Talk'}</span>
                                 {walkieRecording && (
-                                  <span className="px-2 py-0.5 rounded-full bg-white/20 font-mono text-xs">
+                                  <span className="px-1.5 py-0.5 rounded-full bg-white/20 font-mono text-[11px]">
                                     {walkieRecordingSeconds}s / 6s
                                   </span>
                                 )}
                               </button>
+
+                              <div className="flex items-center gap-2 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => setWalkieDisguised((prev) => !prev)}
+                                  className={`min-h-[46px] px-3.5 py-2 rounded-xl text-xs font-bold border transition flex items-center gap-1.5 ${
+                                    walkieDisguised
+                                      ? 'bg-purple-900 text-white border-purple-700 shadow-sm'
+                                      : 'bg-white text-ink-secondary border-stoneline hover:bg-subtle'
+                                  }`}
+                                >
+                                  <span>🕵️ Voice Disguise: {walkieDisguised ? 'ON' : 'OFF'}</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  disabled={!lastReceivedRadio && !snapshot.latestVoiceClip && !snapshot.latestRadioMessage && !snapshot.latestRadioCallout && !lastRadioAudioRef.current}
+                                  onClick={handleReplayLastRadioMessage}
+                                  className="btn-secondary min-h-[46px] px-3.5 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 disabled:opacity-40"
+                                >
+                                  <span>🔊 Replay Last Radio</span>
+                                </button>
+                              </div>
                             </div>
 
                             {/* 4 Role-Tailored Callout Chips */}
@@ -4922,290 +5202,8 @@ function AuiManhuntApp() {
                               </div>
                             </div>
                           </div>
-
-                    {/* Tactical Abilities Sub-Section */}
-                    {!isHunter ? (
-                      <div className="p-4 rounded-xl bg-canvas border border-stoneline text-xs text-ink-secondary space-y-3">
-                        <div>
-                          <strong className="text-ink block">Hider Tactical Abilities &amp; Status</strong>
-                          <p className="mt-0.5">
-                            Keep your sound enabled (<strong className="text-emerald-800">Sound Active 🔊</strong>) so you hear the <strong>Proximity Heartbeat Radar</strong> when a Hunter gets within 40m of you, as well as Hunter siren pings.
-                          </p>
-                        </div>
-
-                        <div className="flex flex-wrap items-center gap-2.5 pt-1">
-                          {catchMode === 'CATCH_PIN' && snapshot.viewerCatchPin && (
-                            <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-300 text-amber-950">
-                              <span className="block text-[10px] uppercase font-bold text-amber-800">2-Digit Catch PIN</span>
-                              <span className="font-mono font-extrabold text-lg tracking-widest text-hunter">{snapshot.viewerCatchPin}</span>
-                              <span className="block text-[11px] text-amber-900">Give this code to a Hunter only when physically caught.</span>
-                            </div>
-                          )}
-
-                          <div className="p-2.5 rounded-xl bg-white border border-stoneline flex-1 min-w-[200px] flex items-center justify-between gap-2">
-                            <div>
-                              <strong className="text-ink block">👻 Ghost Cloak (60s Stealth)</strong>
-                              <span className="text-[11px] text-ink-muted">
-                                {snapshot.viewerGhostCloak?.active
-                                  ? `Cloaked! Hidden from Hunters (${snapshot.viewerGhostCloak.secondsLeft}s left)`
-                                  : snapshot.viewerGhostCloak?.used
-                                  ? 'Already used in this match (limit: 1)'
-                                  : 'Freezes & hides your location from Hunters for 60s'}
-                              </span>
-                            </div>
-                            {!snapshot.viewerGhostCloak?.used && !snapshot.viewerGhostCloak?.active && (
-                              <button
-                                type="button"
-                                disabled={snapshot.state !== 'ACTIVE' || me?.status !== 'ACTIVE'}
-                                onClick={() => {
-                                  soundEngine.playGhostCloakTone();
-                                  dispatchGameAction(
-                                    { action: 'ACTIVATE_GHOST_CLOAK' },
-                                    '👻 Ghost Cloak Activated for 60s!'
-                                  );
-                                }}
-                                className="min-h-[40px] px-3.5 py-1.5 rounded-xl bg-purple-800 hover:bg-purple-900 text-white font-bold text-xs shrink-0 disabled:opacity-40"
-                              >
-                                Activate
-                              </button>
-                            )}
-                          </div>
-                        </div>
-
-                        {me?.photoRequest?.status === 'PENDING' && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setCapturedPhotoUrl(null);
-                              setCameraStreamError(null);
-                              setShowCameraModal(true);
-                            }}
-                            className="btn-hunter px-4 py-2.5 rounded-xl text-xs font-bold"
-                          >
-                            📷 Respond to Active Photo Request ({me.photoRequest.expiresInSeconds}s left)
-                          </button>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="space-y-3">
-                        <div className="p-3.5 rounded-xl bg-canvas border border-stoneline flex items-center justify-between text-xs">
-                          <div>
-                            <strong className="text-ink block">
-                              Sound Alerts Remaining: {snapshot.soundAbility?.remainingUses ?? 0} / {snapshot.soundAbility?.maxUses ?? 3}
-                            </strong>
-                            <span className="text-ink-muted">
-                              {snapshot.state !== 'ACTIVE'
-                                ? 'Tools unlock once the hiding countdown ends'
-                                : (snapshot.soundAbility?.cooldownSecondsLeft || 0) > 0
-                                ? `Cooldown: ${snapshot.soundAbility?.cooldownSecondsLeft}s remaining`
-                                : 'Ready to trigger a 4-second siren on an active Hider'}
-                            </span>
-                          </div>
-                          <span className="px-2.5 py-1 rounded-full bg-hunter-light text-hunter font-bold">
-                            {snapshot.settings.photoRequestsPerHider ?? 1} Photo(s) / Hider
-                          </span>
-                        </div>
-
-                        <div className="space-y-2">
-                          {snapshot.participants
-                            .filter((p) => p.role === 'HIDER')
-                            .map((h) => {
-                              const isCaught = h.status !== 'ACTIVE';
-                              const sa = snapshot.soundAbility;
-                              const soundDisabled =
-                                snapshot.state !== 'ACTIVE' ||
-                                isCaught ||
-                                !sa ||
-                                sa.remainingUses <= 0 ||
-                                sa.cooldownSecondsLeft > 0;
-                              const pr = h.photoRequest;
-                              const remPhotos = h.remainingPhotoRequests ?? (pr ? 0 : snapshot.settings.photoRequestsPerHider ?? 1);
-
-                              return (
-                                <div key={h.id} className="p-3 rounded-xl bg-canvas border border-stoneline flex flex-wrap items-center justify-between gap-2">
-                                  <div>
-                                    <span className="font-bold text-xs text-ink">{h.nickname}</span>
-                                    <span className="text-[11px] text-ink-muted block">
-                                      {h.audioUnlocked ? '🔊 Sound Active on phone' : '🔇 Sound not unlocked yet'}
-                                    </span>
-                                  </div>
-                                  <div className="flex flex-wrap items-center gap-2">
-                                    <button
-                                      type="button"
-                                      disabled={soundDisabled}
-                                      onClick={async () => {
-                                        const res = await dispatchGameAction({ action: 'SEND_SOUND', targetHiderId: h.id });
-                                        if (res?.deliveryStatus) showToast(res.deliveryStatus, 'info');
-                                      }}
-                                      className="btn-hunter min-h-[40px] px-3 py-1.5 rounded-lg text-[11px] font-bold disabled:opacity-40"
-                                    >
-                                      🔊 Send 4s Siren
-                                    </button>
-
-                                    {pr && pr.hasPhoto && (
-                                      <button
-                                        type="button"
-                                        onClick={async () => {
-                                          if (pr.photoDataUrl) {
-                                            setViewerPhotoModal({ nickname: h.nickname, url: pr.photoDataUrl });
-                                            return;
-                                          }
-                                          const cached = photoCacheRef.current.get(pr.id);
-                                          if (cached) {
-                                            setViewerPhotoModal({ nickname: h.nickname, url: cached });
-                                            return;
-                                          }
-                                          if (roomCode) {
-                                            try {
-                                              const res = await fetch(`/api/games?code=${encodeURIComponent(roomCode)}&photoRequestId=${encodeURIComponent(pr.id)}`);
-                                              if (res.ok) {
-                                                const d = await res.json();
-                                                if (d?.photoDataUrl) {
-                                                  photoCacheRef.current.set(pr.id, d.photoDataUrl);
-                                                  setViewerPhotoModal({ nickname: h.nickname, url: d.photoDataUrl });
-                                                  return;
-                                                }
-                                              }
-                                            } catch {}
-                                            if (activePlayerId) {
-                                              await fetchGameState(roomCode, activePlayerId, true);
-                                              const c2 = photoCacheRef.current.get(pr.id);
-                                              if (c2) setViewerPhotoModal({ nickname: h.nickname, url: c2 });
-                                            }
-                                          }
-                                        }}
-                                        className="btn-cedar min-h-[40px] px-3 py-1.5 rounded-lg text-[11px] font-bold"
-                                      >
-                                        📷 View Photo
-                                      </button>
-                                    )}
-
-                                    {pr && pr.status === 'PENDING' ? (
-                                      <span className="px-2.5 py-2 rounded-lg bg-amber-100 text-amber-900 border border-amber-300 text-[11px] font-bold font-mono">
-                                        ⏳ Waiting ({pr.expiresInSeconds}s)
-                                      </span>
-                                    ) : remPhotos > 0 ? (
-                                      <button
-                                        type="button"
-                                        disabled={isCaught || snapshot.state !== 'ACTIVE'}
-                                        onClick={() =>
-                                          dispatchGameAction(
-                                            { action: 'REQUEST_PHOTO', targetHiderId: h.id },
-                                            `Photo request sent to ${h.nickname}! (90s timer started)`
-                                          )
-                                        }
-                                        className="btn-secondary min-h-[40px] px-3 py-1.5 rounded-lg text-[11px] font-semibold disabled:opacity-40"
-                                      >
-                                        📷 Request photo ({remPhotos} left)
-                                      </button>
-                                    ) : (
-                                      <span className="px-2.5 py-2 rounded-lg bg-stone-200 text-stone-700 text-[11px] font-semibold">
-                                        {pr ? `Photo: ${pr.status}` : 'No photos left'}
-                                      </span>
-                                    )}
-                                  </div>
-                                </div>
-                              );
-                            })}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Integrated Live Notes & Match Activity Log */}
-                    <div className="p-3.5 rounded-xl bg-canvas border border-stoneline space-y-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex items-center gap-2">
-                          <span className="text-base">📋</span>
-                          <div>
-                            <h4 className="font-display font-bold text-xs sm:text-sm text-ink">
-                              Live Notes &amp; Activity Log
-                            </h4>
-                            <p className="text-[11px] text-ink-muted">
-                              Broadcast instant text alerts to all players (chime + banner)
-                            </p>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="flex flex-wrap gap-1.5">
-                        {QUICK_NOTE_PRESETS.map((preset) => (
-                          <button
-                            key={preset}
-                            type="button"
-                            disabled={pendingActionKey === 'SEND_NOTE'}
-                            onClick={() => handleSendNote(preset)}
-                            className="min-h-[36px] px-2.5 py-1 rounded-xl bg-white hover:bg-subtle border border-stoneline text-[11px] font-semibold text-ink transition disabled:opacity-50"
-                          >
-                            {preset}
-                          </button>
-                        ))}
-                      </div>
-
-                      <form
-                        onSubmit={(e) => {
-                          e.preventDefault();
-                          handleSendNote();
-                        }}
-                        className="flex items-center gap-2"
-                      >
-                        <input
-                          type="text"
-                          maxLength={140}
-                          value={noteInput}
-                          onChange={(e) => setNoteInput(e.target.value)}
-                          placeholder="Write a live note or alert to all players..."
-                          className="flex-1 h-11 px-3.5 rounded-xl bg-white border border-stoneline text-xs font-semibold text-ink placeholder:text-ink-muted focus:outline-none focus:ring-2 focus:ring-cedar"
-                        />
-                        <button
-                          type="submit"
-                          disabled={!noteInput.trim() || pendingActionKey === 'SEND_NOTE'}
-                          className="btn-cedar h-11 px-4 rounded-xl text-xs font-bold shrink-0 disabled:opacity-45"
-                        >
-                          {pendingActionKey === 'SEND_NOTE' ? '⏳...' : '🔔 Send Note'}
-                        </button>
-                      </form>
-
-                      {snapshot.events && snapshot.events.length > 0 && (
-                        <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1 pt-1.5 border-t border-stoneline">
-                          {[...snapshot.events]
-                            .slice()
-                            .reverse()
-                            .map((evt) => (
-                              <div
-                                key={evt.id}
-                                className="p-2.5 rounded-xl bg-white border border-stoneline text-xs flex items-start justify-between gap-2"
-                              >
-                                <div className="space-y-0.5">
-                                  <div className="flex items-center gap-1.5 flex-wrap">
-                                    <strong className="font-bold text-ink">{evt.senderName}</strong>
-                                    {evt.senderRole && (
-                                      <span
-                                        className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${
-                                          evt.senderRole === 'HUNTER'
-                                            ? 'bg-hunter-light text-hunter'
-                                            : 'bg-cedar-light text-cedar'
-                                        }`}
-                                      >
-                                        {evt.senderRole}
-                                      </span>
-                                    )}
-                                  </div>
-                                  <p className="text-ink-secondary font-medium leading-snug">{evt.message}</p>
-                                </div>
-                                <span className="text-[10px] font-mono text-ink-muted shrink-0">
-                                  {new Date(evt.createdAt).toLocaleTimeString([], {
-                                    hour: '2-digit',
-                                    minute: '2-digit',
-                                    second: '2-digit',
-                                  })}
-                                </span>
-                              </div>
-                            ))}
                         </div>
                       )}
-                    </div>
-                  </div>
-                )}
 
                 {/* TAB 2: PLAYERS */}
                 {effectiveTab === 'players' && (
@@ -5223,31 +5221,6 @@ function AuiManhuntApp() {
                                   <span className="font-mono font-extrabold text-lg tracking-widest text-hunter">{snapshot.viewerCatchPin}</span>
                                 </div>
                               )}
-                              <div className="p-2.5 rounded-xl bg-white border border-stoneline flex-1 min-w-[200px] flex items-center justify-between gap-2">
-                                <div>
-                                  <strong className="text-ink block text-xs">👻 Ghost Cloak (60s Stealth)</strong>
-                                  <span className="text-[11px] text-ink-muted">
-                                    {snapshot.viewerGhostCloak?.active
-                                      ? `Cloaked (${snapshot.viewerGhostCloak.secondsLeft}s left)`
-                                      : snapshot.viewerGhostCloak?.used
-                                      ? 'Used in this match'
-                                      : 'Hides your location from Hunters for 60s'}
-                                  </span>
-                                </div>
-                                {!snapshot.viewerGhostCloak?.used && !snapshot.viewerGhostCloak?.active && (
-                                  <button
-                                    type="button"
-                                    disabled={snapshot.state !== 'ACTIVE' || me?.status !== 'ACTIVE'}
-                                    onClick={() => {
-                                      soundEngine.playGhostCloakTone();
-                                      dispatchGameAction({ action: 'ACTIVATE_GHOST_CLOAK' }, '👻 Ghost Cloak Activated for 60s!');
-                                    }}
-                                    className="min-h-[38px] px-3 py-1.5 rounded-xl bg-purple-800 hover:bg-purple-900 text-white font-bold text-xs shrink-0 disabled:opacity-40"
-                                  >
-                                    Activate
-                                  </button>
-                                )}
-                              </div>
                             </div>
                             {me?.photoRequest?.status === 'PENDING' && (
                               <button
@@ -5274,12 +5247,15 @@ function AuiManhuntApp() {
                                 .map((h) => {
                                   const isCaught = h.status !== 'ACTIVE';
                                   const sa = snapshot.soundAbility;
+                                  const liveCooldown = sa?.cooldownUntilMs
+                                    ? Math.max(0, Math.ceil((sa.cooldownUntilMs - Date.now()) / 1000))
+                                    : sa?.cooldownSecondsLeft || 0;
                                   const soundDisabled =
                                     snapshot.state !== 'ACTIVE' ||
                                     isCaught ||
                                     !sa ||
                                     sa.remainingUses <= 0 ||
-                                    sa.cooldownSecondsLeft > 0;
+                                    liveCooldown > 0;
                                   return (
                                     <button
                                       key={h.id}
@@ -5350,7 +5326,10 @@ function AuiManhuntApp() {
                                     🚨 Out-of-Bounds Exposed
                                   </span>
                                 )}
-                                {distanceToPlayerMeters !== null && (
+                                {distanceToPlayerMeters !== null &&
+                                  (isHunter ||
+                                    p.role !== 'HUNTER' ||
+                                    snapshot.settings.hunterVisibilityMode === 'ALWAYS_LIVE') && (
                                   <span
                                     className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-bold ${
                                       distanceToPlayerMeters <= MAX_CAPTURE_DISTANCE_METERS
@@ -5368,7 +5347,11 @@ function AuiManhuntApp() {
                                   : p.ghostCloakActive && !isMe && !p.isOutOfBoundsExposed
                                   ? '👻 Ghost Cloak active — GPS hidden for 60s'
                                   : p.location
-                                  ? `±${p.location.accuracy}m • updated ${p.location.ageSeconds}s ago`
+                                  ? `±${p.location.accuracy}m • updated ${
+                                      p.location.updatedAt
+                                        ? Math.max(0, Math.round((Date.now() - p.location.updatedAt) / 1000))
+                                        : p.location.ageSeconds
+                                    }s ago`
                                   : p.status === 'CAPTURED'
                                   ? 'Caught — GPS stopped'
                                   : 'Location hidden or waiting for GPS'}
@@ -5579,7 +5562,7 @@ function AuiManhuntApp() {
                   onClick={handleLeaveGame}
                   className="btn-secondary min-h-[52px] py-3.5 px-5 rounded-2xl font-display font-bold text-sm flex-1"
                 >
-                  Leave Game
+                  Exit to Home
                 </button>
               </div>
             </div>
@@ -6018,6 +6001,9 @@ function AuiManhuntApp() {
           </div>
         ))}
       </div>
+
+      {/* Persistent unlocked Walkie-Talkie audio element */}
+      <audio ref={walkiePlayerRef} playsInline preload="auto" className="hidden" />
     </div>
   );
 }
